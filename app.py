@@ -30,7 +30,7 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))  # базовый интервал, но теперь не используется
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))  # не используется, но оставлено
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 PROXY_REFRESH_INTERVAL = 15 * 60
@@ -38,13 +38,14 @@ PROXY_REFRESH_INTERVAL = 15 * 60
 MAX_ITEMS = 20
 MAX_SEARCH_ATTEMPTS = 20
 RETRY_DELAY = 2
-GBP_TO_UAH = 60
-EXTRA_DELIVERY_COST = 120
+USD_TO_UAH = 45          # курс доллара к гривне
+EXTRA_DELIVERY_COST = 150
 
+# Добавляем параметры для США: локация (1 = US), сортировка по новизне, 240 товаров на страницу
 if '?' in EBAY_SEARCH_URL:
-    EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=240&_sop=10'
+    EBAY_SEARCH_URL += '&LH_PrefLoc=1&_ipg=240&_sop=10'
 else:
-    EBAY_SEARCH_URL += '?LH_PrefLoc=3&_ipg=240&_sop=10'
+    EBAY_SEARCH_URL += '?LH_PrefLoc=1&_ipg=240&_sop=10'
 
 if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]):
     logging.error("Не хватает переменных окружения.")
@@ -267,7 +268,8 @@ def telegram_listener():
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_profile_failures
 
-    cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
+    # Куки для США
+    cookies = {'ebay': '%2F', 'm': 'US', 's': 'US', 'siteid': '0'}
 
     if fixed_proxy is not None and fixed_profile is not None:
         logging.info(f"🔁 Используем зафиксированную пару: прокси {fixed_proxy}, профиль {fixed_profile['name']}")
@@ -284,10 +286,8 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_profile = None
                 fixed_profile_failures = 0
             else:
-                # Возвращаем None, но не делаем паузу — это будет обработано в основном цикле
                 return None
 
-    # Поиск новой рабочей пары
     for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
         proxy = proxy_manager.get_random_proxy()
         profile = get_random_profile()
@@ -308,16 +308,16 @@ def _make_request(proxy, profile, cookies):
     headers = {
         'User-Agent': profile['ua'],
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-GB,en;q=0.9',
+        'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': 'https://www.ebay.co.uk/',
+        'Referer': 'https://www.ebay.com/',
         'Upgrade-Insecure-Requests': '1',
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
         'Sec-Fetch-User': '?1',
         'Cache-Control': 'max-age=0',
-        'X-EBay-Site-Id': '3',
+        'X-EBay-Site-Id': '0',          # 0 = США
         'Sec-Ch-Ua': profile['sec_ch_ua'],
         'Sec-Ch-Ua-Mobile': '?0',
         'Sec-Ch-Ua-Platform': '"Windows"' if 'Windows' in profile['ua'] else '"macOS"',
@@ -369,7 +369,7 @@ def _make_request(proxy, profile, cookies):
 def fetch_ebay_html_with_retry():
     return fetch_ebay_html_with_fixed_pair()
 
-# ============ ПАРСИНГ ============
+# ============ ПАРСИНГ (адаптирован для USD) ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -383,15 +383,15 @@ def clean_title(title):
     title = re.sub(r'(?i)new\s*listing', '', title)
     title = re.sub(r'(?i)\blisting\b', '', title)
     title = re.sub(r'(?i)\bnew\b', '', title)
-    title = re.sub(r'[^\w\s£€$]', ' ', title)
+    title = re.sub(r'[^\w\s$€]', ' ', title)  # оставляем символы валют
     title = re.sub(r'\s+', ' ', title).strip()
     return title
 
-def is_gbp_price(text):
+def is_usd_price(text):
     if not text: return False
-    if re.search(r'£|\bGBP\b', text, re.I):
+    if re.search(r'\$|\bUSD\b', text, re.I):
         return True
-    if re.search(r'[$€]|USD|EUR', text, re.I):
+    if re.search(r'[£€]|GBP|EUR', text, re.I):
         return False
     return re.search(r'\d', text) is not None
 
@@ -401,7 +401,7 @@ def extract_range_price(card):
         first = price_spans[i].get_text(strip=True)
         middle = price_spans[i+1].get_text(strip=True).lower()
         third = price_spans[i+2].get_text(strip=True)
-        if 'to' in middle and re.search(r'[£€$]', first) and re.search(r'[£€$]', third):
+        if 'to' in middle and re.search(r'[\$€]', first) and re.search(r'[\$€]', third):
             return f"{first} до {third}"
     to_elem = card.find(string=re.compile(r'\bto\b', re.I))
     if to_elem:
@@ -412,13 +412,13 @@ def extract_range_price(card):
             for sibling in parent.previous_siblings:
                 if hasattr(sibling, 'get_text'):
                     txt = sibling.get_text(strip=True)
-                    if re.search(r'[£€$]\s*[\d,]+\.?\d*', txt):
+                    if re.search(r'[\$€]\s*[\d,]+\.?\d*', txt):
                         prev_price = txt
                         break
             for sibling in parent.next_siblings:
                 if hasattr(sibling, 'get_text'):
                     txt = sibling.get_text(strip=True)
-                    if re.search(r'[£€$]\s*[\d,]+\.?\d*', txt):
+                    if re.search(r'[\$€]\s*[\d,]+\.?\d*', txt):
                         next_price = txt
                         break
             if prev_price and next_price:
@@ -466,8 +466,8 @@ def extract_price_jsonld(card, url=None, soup=None):
             except:
                 continue
     for price, curr in candidates:
-        if curr == 'GBP' or (curr == '' and str(price).startswith('£')):
-            return f"£{price}"
+        if curr == 'USD' or (curr == '' and str(price).startswith('$')):
+            return f"${price}"
     for price, curr in candidates:
         if curr:
             return f"{curr} {price}"
@@ -492,10 +492,10 @@ def extract_price_css(card):
         if text:
             candidates.append(text)
     for cand in candidates:
-        if is_gbp_price(cand):
+        if is_usd_price(cand):
             parts = cand.split()
             for p in parts:
-                if is_gbp_price(p):
+                if is_usd_price(p):
                     return p
             return cand
     if candidates:
@@ -509,7 +509,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
         if 'delivery' in text_lower or 'shipping' in text_lower:
             if 'free' in text_lower:
                 return "Бесплатно"
-            match = re.search(r'([+]\s*)?([£€$]\s*[\d,]+\.?\d*)', text)
+            match = re.search(r'([+]\s*)?([\$€]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(2)
                 if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
@@ -541,7 +541,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
                             amount = f"{currency} {shipping}" if currency else str(shipping)
                             if range_prices and any(amount in p or p in amount for p in range_prices):
                                 pass
-                            elif item_price and str(shipping) == str(item_price) and currency == 'GBP':
+                            elif item_price and str(shipping) == str(item_price) and currency == 'USD':
                                 pass
                             else:
                                 return amount
@@ -556,7 +556,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
                             amount = f"{currency} {shipping}" if currency else str(shipping)
                             if range_prices and any(amount in p or p in amount for p in range_prices):
                                 pass
-                            elif item_price and str(shipping) == str(item_price) and currency == 'GBP':
+                            elif item_price and str(shipping) == str(item_price) and currency == 'USD':
                                 pass
                             else:
                                 return amount
@@ -580,7 +580,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
                 continue
             if re.search(r'\bfree\b', text.lower()):
                 return "Бесплатно"
-            match = re.search(r'([+]\s*)?([£€$]\s*[\d,]+\.?\d*)', text)
+            match = re.search(r'([+]\s*)?([\$€]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(2)
                 if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
@@ -592,7 +592,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
                 if len(text) > 10 or re.search(r'\d', text):
                     return text
 
-    match = re.search(r'\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html_lower)
+    match = re.search(r'\+?\s*([\$€]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html_lower)
     if match:
         pc = match.group(1)
         if range_prices and any(pc in p or p in pc for p in range_prices):
@@ -600,7 +600,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
         else:
             if not (item_price and pc == item_price):
                 return pc
-    match = re.search(r'shipping:\s*([£€$]\s*[\d,]+\.?\d*)', html_lower)
+    match = re.search(r'shipping:\s*([\$€]\s*[\d,]+\.?\d*)', html_lower)
     if match:
         pc = match.group(1)
         if range_prices and any(pc in p or p in pc for p in range_prices):
@@ -675,14 +675,14 @@ def extract_buy_it_now_info(card):
     price_spans = card.select('span.s-card__price, span.s-item__price, [class*="price"]')
     if len(price_spans) >= 2:
         second_price = price_spans[1].get_text(strip=True)
-        if re.search(r'[£€$]', second_price):
+        if re.search(r'[\$€]', second_price):
             return True, second_price
     parent = buy_it_now_elem.find_parent()
     if parent:
         price_elem = parent.find_next('span', class_=re.compile(r'price'))
         if price_elem:
             price_text = price_elem.get_text(strip=True)
-            if re.search(r'[£€$]', price_text):
+            if re.search(r'[\$€]', price_text):
                 return True, price_text
     return True, None
 
@@ -707,7 +707,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         if not url or '/itm/' not in url:
             continue
         if url.startswith('/'):
-            url = 'https://www.ebay.co.uk' + url
+            url = 'https://www.ebay.com' + url
         item_id = extract_item_id(url)
         if not item_id:
             continue
@@ -725,7 +725,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             parts = price.split(' до ')
             if len(parts) == 2:
                 range_prices = [parts[0].strip(), parts[1].strip()]
-        if price and not is_gbp_price(price):
+        if price and not is_usd_price(price):
             price = None
         shipping = extract_shipping(card, item_price=price, range_prices=range_prices)
         best_offer = extract_best_offer(card)
@@ -753,7 +753,7 @@ def parse_ebay_listings_fallback(soup, max_items):
     for link in itm_links:
         url = link.get('href')
         if url.startswith('/'):
-            url = 'https://www.ebay.co.uk' + url
+            url = 'https://www.ebay.com' + url
         item_id = extract_item_id(url)
         if not item_id:
             continue
@@ -770,7 +770,7 @@ def parse_ebay_listings_fallback(soup, max_items):
         for _ in range(5):
             if parent:
                 price = extract_price_jsonld(parent, url) or extract_price_css(parent)
-                if price and not is_gbp_price(price):
+                if price and not is_usd_price(price):
                     price = None
                 shipping = extract_shipping(parent, item_price=price)
                 best_offer = extract_best_offer(parent)
@@ -804,7 +804,7 @@ def perform_initial_snapshot():
     return True
 
 def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is_auction=False):
-    if not price_str or price_str == "Цена не указана (не GBP)" or "до" in price_str:
+    if not price_str or price_str == "Цена не указана (не USD)" or "до" in price_str:
         return None
 
     price_num = None
@@ -825,12 +825,11 @@ def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is
         if match:
             shipping_num = float(match.group(1))
 
-    total_gbp = price_num + shipping_num
-    total_uah = int(total_gbp * GBP_TO_UAH) + EXTRA_DELIVERY_COST
+    total_usd = price_num + shipping_num
+    total_uah = int(total_usd * USD_TO_UAH) + EXTRA_DELIVERY_COST
     return total_uah
 
 def check_and_send_new_items():
-    """Возвращает True, если страница успешно загружена и обработана, иначе False."""
     seen = get_seen_ids()
     logging.info(f"В базе {len(seen)} товаров")
     html = fetch_ebay_html_with_retry()
@@ -845,11 +844,11 @@ def check_and_send_new_items():
             logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, auction: {data.get('auction')}, has_buy_it_now: {data.get('has_buy_it_now')}")
     if new:
         for item in new:
-            msg = f"🇬🇧 <b>НОВЫЙ ТОВАР Англия</b> 🇬🇧\n\n<b>{item['title']}</b>\n\n"
+            msg = f"🇺🇸 <b>НОВЫЙ ТОВАР США</b> 🇺🇸\n\n<b>{item['title']}</b>\n\n"
             if item['price']:
                 msg += f"💰 Цена: {item['price']}\n"
             else:
-                msg += f"💰 Цена не указана (не GBP)\n"
+                msg += f"💰 Цена не указана (не USD)\n"
             if item['shipping']:
                 msg += f"🚚 Доставка: {item['shipping']}\n"
             else:
@@ -898,11 +897,9 @@ def bot_worker():
         try:
             success = check_and_send_new_items()
             if success:
-                # При успешной загрузке ждём случайное время от 60 до 72 секунд
                 wait = random.uniform(60, 72)
                 logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
             else:
-                # При ошибке ждём короткую паузу (2–5 секунд) и продолжаем
                 wait = random.uniform(2, 5)
                 logging.info(f"⚠️ Ошибка при проверке. Повтор через {wait:.1f} секунд.")
             time.sleep(wait)
@@ -912,14 +909,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (динамическая пауза в зависимости от успеха)"
+    return "eBay бот (США) работает"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, улучшена логика пауз при ошибках). Интервал 60-72 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот для eBay США запущен. Интервал 60-72 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
