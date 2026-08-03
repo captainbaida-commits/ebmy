@@ -835,6 +835,7 @@ def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is
     return total_uah
 
 def check_and_send_new_items():
+    global fixed_proxy, fixed_profile
     seen = get_seen_ids()
     logging.info(f"В базе {len(seen)} товаров")
     html = fetch_ebay_html_with_retry()
@@ -842,6 +843,17 @@ def check_and_send_new_items():
         logging.warning("Не удалось загрузить страницу, проверка пропущена")
         return False
     current = parse_ebay_listings(html)
+    # Проверяем, есть ли среди товаров хотя бы один с ценой в USD
+    usd_found = any(item.get('price') is not None for item in current.values())
+    if len(current) > 0 and not usd_found:
+        logging.warning("⚠️ Ни один товар не имеет цены в USD. Сбрасываем прокси и ищем новый...")
+        fixed_proxy = None
+        fixed_profile = None
+        # Также можно удалить текущий прокси из списка рабочих, если он есть
+        if fixed_proxy and proxy_manager:
+            proxy_manager.mark_bad_proxy(fixed_proxy)
+        return False
+
     new = []
     for item_id, data in current.items():
         if item_id not in seen:
@@ -914,14 +926,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот (США) работает"
+    return "eBay бот (США) работает с автоматической сменой прокси"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот для eBay США запущен. Интервал 40-52 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот для eBay США запущен. Интервал 40-52 сек, автосмена прокси при отсутствии USD. Команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
