@@ -15,12 +15,6 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import execute_values
 
-# ============================================================
-# ВАЖНО: Для корректного отображения цен в USD используйте
-# прокси-серверы из США. Установите в PROXY_LIST URL с country=US
-# Пример: https://api.proxyscrape.com/...&country=US&timeout=150
-# ============================================================
-
 # Отключаем проверку SSL
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -375,7 +369,7 @@ def _make_request(proxy, profile, cookies):
 def fetch_ebay_html_with_retry():
     return fetch_ebay_html_with_fixed_pair()
 
-# ============ ПАРСИНГ ============
+# ============ ПАРСИНГ (только USD) ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -394,17 +388,10 @@ def clean_title(title):
     return title
 
 def is_usd_price(text):
-    """
-    Определяет, является ли текст ценой в USD.
-    Возвращает True, если:
-    - есть явный символ $ или слово USD
-    - ИЛИ текст содержит только цифры, точки, запятые и пробелы (без букв валют)
-    """
+    """Возвращает True только если в строке есть $ или USD."""
     if not text:
         return False
     if re.search(r'\$|\bUSD\b', text, re.I):
-        return True
-    if re.match(r'^[\d,.\s]+$', text.strip()):
         return True
     return False
 
@@ -414,8 +401,9 @@ def extract_range_price(card):
         first = price_spans[i].get_text(strip=True)
         middle = price_spans[i+1].get_text(strip=True).lower()
         third = price_spans[i+2].get_text(strip=True)
-        if 'to' in middle and is_usd_price(first) and is_usd_price(third):
-            return f"{first} до {third}"
+        if 'to' in middle and re.search(r'[\$]', first) and re.search(r'[\$]', third):
+            if is_usd_price(first) and is_usd_price(third):
+                return f"{first} до {third}"
     to_elem = card.find(string=re.compile(r'\bto\b', re.I))
     if to_elem:
         parent = to_elem.find_parent()
@@ -454,14 +442,14 @@ def extract_price_jsonld(card, url=None, soup=None):
                     price = offers.get('price')
                     currency = offers.get('priceCurrency', '')
                     if price and price != '0':
-                        if currency == 'USD' or (currency == '' and is_usd_price(str(price))):
+                        if currency == 'USD' or (currency == '' and str(price).startswith('$')):
                             candidates.append((price, currency))
                 elif isinstance(offers, list):
                     for off in offers:
                         price = off.get('price')
                         currency = off.get('priceCurrency', '')
                         if price and price != '0':
-                            if currency == 'USD' or (currency == '' and is_usd_price(str(price))):
+                            if currency == 'USD' or (currency == '' and str(price).startswith('$')):
                                 candidates.append((price, currency))
         except:
             pass
@@ -477,15 +465,14 @@ def extract_price_jsonld(card, url=None, soup=None):
                         price = offers.get('price')
                         currency = offers.get('priceCurrency', '')
                         if price and price != '0':
-                            if currency == 'USD' or (currency == '' and is_usd_price(str(price))):
+                            if currency == 'USD' or (currency == '' and str(price).startswith('$')):
                                 candidates.append((price, currency))
             except:
                 continue
     for price, curr in candidates:
-        if curr == 'USD' or (curr == '' and is_usd_price(str(price))):
-            if curr == '':
-                return f"${price}"
+        if curr == 'USD' or (curr == '' and str(price).startswith('$')):
             return f"${price}"
+        # если валюта другая, не возвращаем
     return None
 
 def extract_price_css(card):
@@ -514,22 +501,24 @@ def extract_price_css(card):
     return None
 
 def extract_shipping(card, item_price=None, range_prices=None):
+    # Сначала ищем элемент с классом .su-styled-text.secondary.large, содержащий delivery/shipping
     for elem in card.select('.su-styled-text.secondary.large'):
         text = elem.get_text(strip=True)
         text_lower = text.lower()
         if 'delivery' in text_lower or 'shipping' in text_lower:
             if 'free' in text_lower:
                 return "Бесплатно"
-            match = re.search(r'([+]\s*)?([\$]?\s*[\d,]+\.?\d*)', text)
+            # Извлекаем цену, только если она в USD
+            match = re.search(r'([+]\s*)?([\$]\s*[\d,]+\.?\d*)', text)
             if match:
-                price_candidate = match.group(2).strip()
-                if is_usd_price(price_candidate):
-                    if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
-                        pass
-                    elif item_price and price_candidate == item_price:
-                        pass
-                    else:
-                        return price_candidate
+                price_candidate = match.group(2)
+                if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
+                    pass
+                elif item_price and price_candidate == item_price:
+                    pass
+                else:
+                    return price_candidate
+            # Если цена не найдена, но есть текст – возвращаем его
             if len(text) > 3:
                 return text
 
@@ -537,6 +526,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
     if re.search(r'free\s+delivery', html_lower) or re.search(r'free\s+shipping', html_lower):
         return "Бесплатно"
 
+    # JSON-LD
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
@@ -550,11 +540,12 @@ def extract_shipping(card, item_price=None, range_prices=None):
                             return "Бесплатно"
                         if isinstance(shipping, (int, float)):
                             currency = offers.get('priceCurrency', '')
-                            if currency == 'USD' or currency == '':
-                                amount = f"${shipping}" if currency == '' else f"{currency} {shipping}"
+                            # только USD
+                            if currency == 'USD':
+                                amount = f"${shipping}"
                                 if range_prices and any(amount in p or p in amount for p in range_prices):
                                     pass
-                                elif item_price and str(shipping) == str(item_price) and currency in ('USD', ''):
+                                elif item_price and str(shipping) == str(item_price) and currency == 'USD':
                                     pass
                                 else:
                                     return amount
@@ -566,17 +557,18 @@ def extract_shipping(card, item_price=None, range_prices=None):
                             return "Бесплатно"
                         if isinstance(shipping, (int, float)):
                             currency = first.get('priceCurrency', '')
-                            if currency == 'USD' or currency == '':
-                                amount = f"${shipping}" if currency == '' else f"{currency} {shipping}"
+                            if currency == 'USD':
+                                amount = f"${shipping}"
                                 if range_prices and any(amount in p or p in amount for p in range_prices):
                                     pass
-                                elif item_price and str(shipping) == str(item_price) and currency in ('USD', ''):
+                                elif item_price and str(shipping) == str(item_price) and currency == 'USD':
                                     pass
                                 else:
                                     return amount
         except:
             pass
 
+    # CSS-селекторы
     shipping_selectors = [
         'span.s-item__shipping', 'div.s-item__shipping',
         'span.s-item__logisticsCost', 'span.s-item__delivery',
@@ -594,37 +586,37 @@ def extract_shipping(card, item_price=None, range_prices=None):
                 continue
             if re.search(r'\bfree\b', text.lower()):
                 return "Бесплатно"
-            match = re.search(r'([+]\s*)?([\$]?\s*[\d,]+\.?\d*)', text)
+            # Ищем цену только с $
+            match = re.search(r'([+]\s*)?([\$]\s*[\d,]+\.?\d*)', text)
             if match:
-                price_candidate = match.group(2).strip()
-                if is_usd_price(price_candidate):
-                    if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
-                        continue
-                    if item_price and price_candidate == item_price:
-                        continue
-                    return price_candidate
+                price_candidate = match.group(2)
+                if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
+                    continue
+                if item_price and price_candidate == item_price:
+                    continue
+                return price_candidate
             if re.search(r'(?i)(delivery|shipping)', text) and len(text) > 5:
                 if len(text) > 10 or re.search(r'\d', text):
                     return text
 
-    match = re.search(r'\+?\s*([\$]?\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html_lower)
+    # Регулярные выражения по HTML (только с $)
+    match = re.search(r'\+?\s*([\$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html_lower)
     if match:
-        pc = match.group(1).strip()
-        if is_usd_price(pc):
-            if range_prices and any(pc in p or p in pc for p in range_prices):
-                pass
-            else:
-                if not (item_price and pc == item_price):
-                    return pc
-    match = re.search(r'shipping:\s*([\$]?\s*[\d,]+\.?\d*)', html_lower)
+        pc = match.group(1)
+        if range_prices and any(pc in p or p in pc for p in range_prices):
+            pass
+        else:
+            if not (item_price and pc == item_price):
+                return pc
+    match = re.search(r'shipping:\s*([\$]\s*[\d,]+\.?\d*)', html_lower)
     if match:
-        pc = match.group(1).strip()
-        if is_usd_price(pc):
-            if range_prices and any(pc in p or p in pc for p in range_prices):
-                pass
-            else:
-                if not (item_price and pc == item_price):
-                    return pc
+        pc = match.group(1)
+        if range_prices and any(pc in p or p in pc for p in range_prices):
+            pass
+        else:
+            if not (item_price and pc == item_price):
+                return pc
+    # Текстовые описания (без цены)
     match = re.search(r'(delivery in\s+\d+[-\s]*\d*\s*(days?|weeks?|business days?|working days?))', html_lower)
     if match:
         return match.group(1).strip()
@@ -701,7 +693,7 @@ def extract_buy_it_now_info(card):
             price_text = price_elem.get_text(strip=True)
             if is_usd_price(price_text):
                 return True, price_text
-    return True, None
+    return True, None  # есть надпись, но цену не нашли или не USD
 
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
@@ -742,9 +734,11 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             parts = price.split(' до ')
             if len(parts) == 2:
                 range_prices = [parts[0].strip(), parts[1].strip()]
+        # Если цена не USD – обнуляем
         if price and not is_usd_price(price):
             price = None
         shipping = extract_shipping(card, item_price=price, range_prices=range_prices)
+        # Если доставка не USD и не "Бесплатно" – можно оставить как текст, но для расчёта она не используется
         best_offer = extract_best_offer(card)
         auction = extract_auction(card)
         has_bin, bin_price = extract_buy_it_now_info(card)
@@ -838,19 +832,15 @@ def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is
 
     shipping_num = 0.0
     if shipping_str and shipping_str != "Бесплатно" and shipping_str != "не указана" and shipping_str is not None:
-        if is_usd_price(shipping_str):
-            match = re.search(r'([\d,]+\.?\d*)', shipping_str.replace(',', ''))
-            if match:
-                shipping_num = float(match.group(1))
-        else:
-            shipping_num = 0.0
+        match = re.search(r'([\d,]+\.?\d*)', shipping_str.replace(',', ''))
+        if match:
+            shipping_num = float(match.group(1))
 
     total_usd = price_num + shipping_num
     total_uah = int(total_usd * USD_TO_UAH) + EXTRA_DELIVERY_COST
     return total_uah
 
 def check_and_send_new_items():
-    global fixed_proxy, fixed_profile
     seen = get_seen_ids()
     logging.info(f"В базе {len(seen)} товаров")
     html = fetch_ebay_html_with_retry()
@@ -858,16 +848,6 @@ def check_and_send_new_items():
         logging.warning("Не удалось загрузить страницу, проверка пропущена")
         return False
     current = parse_ebay_listings(html)
-    # Проверяем, есть ли среди товаров хотя бы один с ценой в USD
-    usd_found = any(item.get('price') is not None for item in current.values())
-    if len(current) > 0 and not usd_found:
-        logging.warning("⚠️ Ни один товар не имеет цены в USD. Сбрасываем прокси и ищем новый...")
-        if fixed_proxy:
-            proxy_manager.mark_bad_proxy(fixed_proxy)
-        fixed_proxy = None
-        fixed_profile = None
-        return False
-
     new = []
     for item_id, data in current.items():
         if item_id not in seen:
@@ -876,17 +856,14 @@ def check_and_send_new_items():
     if new:
         for item in new:
             msg = f"🇺🇸 <b>НОВЫЙ ТОВАР США</b> 🇺🇸\n\n<b>{item['title']}</b>\n\n"
-            # Выводим цену только если она определена
             if item['price']:
                 msg += f"💰 Цена: {item['price']}\n"
             else:
                 msg += f"💰 Цена не указана (не USD)\n"
-            # Доставку выводим только если цена определена (тогда доставка актуальна)
-            if item['price'] and item['shipping']:
+            if item['shipping']:
                 msg += f"🚚 Доставка: {item['shipping']}\n"
-            elif item['price'] and not item['shipping']:
+            else:
                 msg += f"🚚 Доставка: не указана\n"
-            # Если цена не определена, строку доставки вообще не выводим
             if item.get('best_offer', False):
                 msg += f"✅ Сделать предложение (Best Offer)\n"
             if item.get('auction', False):
@@ -943,14 +920,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот (США) работает с автосменой прокси"
+    return "eBay бот (США) работает"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот для eBay США запущен. Интервал 40-52 сек, автосмена прокси при отсутствии USD. Команды /stop /start")
+    send_telegram_message("🚀 Бот для eBay США запущен. Интервал 40-52 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
