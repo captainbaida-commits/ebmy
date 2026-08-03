@@ -15,6 +15,12 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import execute_values
 
+# ============================================================
+# ВАЖНО: Для корректного отображения цен в USD используйте
+# прокси-серверы из США. Установите в PROXY_LIST URL с country=US
+# Пример: https://api.proxyscrape.com/...&country=US&timeout=150
+# ============================================================
+
 # Отключаем проверку SSL
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -369,7 +375,7 @@ def _make_request(proxy, profile, cookies):
 def fetch_ebay_html_with_retry():
     return fetch_ebay_html_with_fixed_pair()
 
-# ============ ПАРСИНГ (адаптирован для USD) ============
+# ============ ПАРСИНГ (только USD) ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -383,17 +389,17 @@ def clean_title(title):
     title = re.sub(r'(?i)new\s*listing', '', title)
     title = re.sub(r'(?i)\blisting\b', '', title)
     title = re.sub(r'(?i)\bnew\b', '', title)
-    title = re.sub(r'[^\w\s$€]', ' ', title)  # оставляем символы валют
+    title = re.sub(r'[^\w\s$€]', ' ', title)
     title = re.sub(r'\s+', ' ', title).strip()
     return title
 
 def is_usd_price(text):
-    if not text: return False
+    """Возвращает True только если в строке есть $ или USD."""
+    if not text:
+        return False
     if re.search(r'\$|\bUSD\b', text, re.I):
         return True
-    if re.search(r'[£€]|GBP|EUR', text, re.I):
-        return False
-    return re.search(r'\d', text) is not None
+    return False
 
 def extract_range_price(card):
     price_spans = card.select('span.s-card__price, span.s-item__price, [class*="price"]')
@@ -401,8 +407,9 @@ def extract_range_price(card):
         first = price_spans[i].get_text(strip=True)
         middle = price_spans[i+1].get_text(strip=True).lower()
         third = price_spans[i+2].get_text(strip=True)
-        if 'to' in middle and re.search(r'[\$€]', first) and re.search(r'[\$€]', third):
-            return f"{first} до {third}"
+        if 'to' in middle and re.search(r'[\$]', first) and re.search(r'[\$]', third):
+            if is_usd_price(first) and is_usd_price(third):
+                return f"{first} до {third}"
     to_elem = card.find(string=re.compile(r'\bto\b', re.I))
     if to_elem:
         parent = to_elem.find_parent()
@@ -412,13 +419,13 @@ def extract_range_price(card):
             for sibling in parent.previous_siblings:
                 if hasattr(sibling, 'get_text'):
                     txt = sibling.get_text(strip=True)
-                    if re.search(r'[\$€]\s*[\d,]+\.?\d*', txt):
+                    if is_usd_price(txt):
                         prev_price = txt
                         break
             for sibling in parent.next_siblings:
                 if hasattr(sibling, 'get_text'):
                     txt = sibling.get_text(strip=True)
-                    if re.search(r'[\$€]\s*[\d,]+\.?\d*', txt):
+                    if is_usd_price(txt):
                         next_price = txt
                         break
             if prev_price and next_price:
@@ -441,13 +448,15 @@ def extract_price_jsonld(card, url=None, soup=None):
                     price = offers.get('price')
                     currency = offers.get('priceCurrency', '')
                     if price and price != '0':
-                        candidates.append((price, currency))
+                        if currency == 'USD' or (currency == '' and str(price).startswith('$')):
+                            candidates.append((price, currency))
                 elif isinstance(offers, list):
                     for off in offers:
                         price = off.get('price')
                         currency = off.get('priceCurrency', '')
                         if price and price != '0':
-                            candidates.append((price, currency))
+                            if currency == 'USD' or (currency == '' and str(price).startswith('$')):
+                                candidates.append((price, currency))
         except:
             pass
     if soup and url:
@@ -462,17 +471,13 @@ def extract_price_jsonld(card, url=None, soup=None):
                         price = offers.get('price')
                         currency = offers.get('priceCurrency', '')
                         if price and price != '0':
-                            candidates.append((price, currency))
+                            if currency == 'USD' or (currency == '' and str(price).startswith('$')):
+                                candidates.append((price, currency))
             except:
                 continue
     for price, curr in candidates:
         if curr == 'USD' or (curr == '' and str(price).startswith('$')):
             return f"${price}"
-    for price, curr in candidates:
-        if curr:
-            return f"{curr} {price}"
-        else:
-            return str(price)
     return None
 
 def extract_price_css(card):
@@ -485,11 +490,11 @@ def extract_price_css(card):
     for sel in selectors:
         for elem in card.select(sel):
             text = elem.get_text(strip=True)
-            if text:
+            if text and is_usd_price(text):
                 candidates.append(text)
     for elem in card.select('[class*="price"]'):
         text = elem.get_text(strip=True)
-        if text:
+        if text and is_usd_price(text):
             candidates.append(text)
     for cand in candidates:
         if is_usd_price(cand):
@@ -498,8 +503,6 @@ def extract_price_css(card):
                 if is_usd_price(p):
                     return p
             return cand
-    if candidates:
-        return candidates[0]
     return None
 
 def extract_shipping(card, item_price=None, range_prices=None):
@@ -509,7 +512,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
         if 'delivery' in text_lower or 'shipping' in text_lower:
             if 'free' in text_lower:
                 return "Бесплатно"
-            match = re.search(r'([+]\s*)?([\$€]\s*[\d,]+\.?\d*)', text)
+            match = re.search(r'([+]\s*)?([\$]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(2)
                 if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
@@ -538,13 +541,14 @@ def extract_shipping(card, item_price=None, range_prices=None):
                             return "Бесплатно"
                         if isinstance(shipping, (int, float)):
                             currency = offers.get('priceCurrency', '')
-                            amount = f"{currency} {shipping}" if currency else str(shipping)
-                            if range_prices and any(amount in p or p in amount for p in range_prices):
-                                pass
-                            elif item_price and str(shipping) == str(item_price) and currency == 'USD':
-                                pass
-                            else:
-                                return amount
+                            if currency == 'USD':
+                                amount = f"${shipping}"
+                                if range_prices and any(amount in p or p in amount for p in range_prices):
+                                    pass
+                                elif item_price and str(shipping) == str(item_price) and currency == 'USD':
+                                    pass
+                                else:
+                                    return amount
                 elif isinstance(offers, list) and len(offers) > 0:
                     first = offers[0]
                     shipping = first.get('shippingCost')
@@ -553,13 +557,14 @@ def extract_shipping(card, item_price=None, range_prices=None):
                             return "Бесплатно"
                         if isinstance(shipping, (int, float)):
                             currency = first.get('priceCurrency', '')
-                            amount = f"{currency} {shipping}" if currency else str(shipping)
-                            if range_prices and any(amount in p or p in amount for p in range_prices):
-                                pass
-                            elif item_price and str(shipping) == str(item_price) and currency == 'USD':
-                                pass
-                            else:
-                                return amount
+                            if currency == 'USD':
+                                amount = f"${shipping}"
+                                if range_prices and any(amount in p or p in amount for p in range_prices):
+                                    pass
+                                elif item_price and str(shipping) == str(item_price) and currency == 'USD':
+                                    pass
+                                else:
+                                    return amount
         except:
             pass
 
@@ -580,7 +585,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
                 continue
             if re.search(r'\bfree\b', text.lower()):
                 return "Бесплатно"
-            match = re.search(r'([+]\s*)?([\$€]\s*[\d,]+\.?\d*)', text)
+            match = re.search(r'([+]\s*)?([\$]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(2)
                 if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
@@ -592,7 +597,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
                 if len(text) > 10 or re.search(r'\d', text):
                     return text
 
-    match = re.search(r'\+?\s*([\$€]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html_lower)
+    match = re.search(r'\+?\s*([\$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html_lower)
     if match:
         pc = match.group(1)
         if range_prices and any(pc in p or p in pc for p in range_prices):
@@ -600,7 +605,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
         else:
             if not (item_price and pc == item_price):
                 return pc
-    match = re.search(r'shipping:\s*([\$€]\s*[\d,]+\.?\d*)', html_lower)
+    match = re.search(r'shipping:\s*([\$]\s*[\d,]+\.?\d*)', html_lower)
     if match:
         pc = match.group(1)
         if range_prices and any(pc in p or p in pc for p in range_prices):
@@ -675,14 +680,14 @@ def extract_buy_it_now_info(card):
     price_spans = card.select('span.s-card__price, span.s-item__price, [class*="price"]')
     if len(price_spans) >= 2:
         second_price = price_spans[1].get_text(strip=True)
-        if re.search(r'[\$€]', second_price):
+        if is_usd_price(second_price):
             return True, second_price
     parent = buy_it_now_elem.find_parent()
     if parent:
         price_elem = parent.find_next('span', class_=re.compile(r'price'))
         if price_elem:
             price_text = price_elem.get_text(strip=True)
-            if re.search(r'[\$€]', price_text):
+            if is_usd_price(price_text):
                 return True, price_text
     return True, None
 
