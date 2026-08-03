@@ -402,13 +402,10 @@ def is_usd_price(text):
     """
     if not text:
         return False
-    # Если есть $ или USD – точно USD
     if re.search(r'\$|\bUSD\b', text, re.I):
         return True
-    # Если текст содержит только цифры, разделители и пробелы – считаем USD (нет явной другой валюты)
     if re.match(r'^[\d,.\s]+$', text.strip()):
         return True
-    # Иначе – не USD
     return False
 
 def extract_range_price(card):
@@ -486,7 +483,6 @@ def extract_price_jsonld(card, url=None, soup=None):
                 continue
     for price, curr in candidates:
         if curr == 'USD' or (curr == '' and is_usd_price(str(price))):
-            # Если цена без валюты, добавляем $
             if curr == '':
                 return f"${price}"
             return f"${price}"
@@ -524,7 +520,6 @@ def extract_shipping(card, item_price=None, range_prices=None):
         if 'delivery' in text_lower or 'shipping' in text_lower:
             if 'free' in text_lower:
                 return "Бесплатно"
-            # Ищем цену с $ или просто число
             match = re.search(r'([+]\s*)?([\$]?\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(2).strip()
@@ -535,7 +530,6 @@ def extract_shipping(card, item_price=None, range_prices=None):
                         pass
                     else:
                         return price_candidate
-            # Если цена не найдена, но есть текст – возвращаем его
             if len(text) > 3:
                 return text
 
@@ -748,7 +742,6 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             parts = price.split(' до ')
             if len(parts) == 2:
                 range_prices = [parts[0].strip(), parts[1].strip()]
-        # Если цена не USD – обнуляем
         if price and not is_usd_price(price):
             price = None
         shipping = extract_shipping(card, item_price=price, range_prices=range_prices)
@@ -845,13 +838,11 @@ def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is
 
     shipping_num = 0.0
     if shipping_str and shipping_str != "Бесплатно" and shipping_str != "не указана" and shipping_str is not None:
-        # Проверяем, что доставка в USD (содержит $ или только цифры)
         if is_usd_price(shipping_str):
             match = re.search(r'([\d,]+\.?\d*)', shipping_str.replace(',', ''))
             if match:
                 shipping_num = float(match.group(1))
         else:
-            # Если доставка в другой валюте, не учитываем
             shipping_num = 0.0
 
     total_usd = price_num + shipping_num
@@ -869,7 +860,6 @@ def check_and_send_new_items():
     current = parse_ebay_listings(html)
     # Проверяем, есть ли среди товаров хотя бы один с ценой в USD
     usd_found = any(item.get('price') is not None for item in current.values())
-    # Если товаров много, но ни одного с ценой – сбрасываем прокси
     if len(current) > 0 and not usd_found:
         logging.warning("⚠️ Ни один товар не имеет цены в USD. Сбрасываем прокси и ищем новый...")
         if fixed_proxy:
@@ -886,14 +876,17 @@ def check_and_send_new_items():
     if new:
         for item in new:
             msg = f"🇺🇸 <b>НОВЫЙ ТОВАР США</b> 🇺🇸\n\n<b>{item['title']}</b>\n\n"
+            # Выводим цену только если она определена
             if item['price']:
                 msg += f"💰 Цена: {item['price']}\n"
             else:
                 msg += f"💰 Цена не указана (не USD)\n"
-            if item['shipping']:
+            # Доставку выводим только если цена определена (тогда доставка актуальна)
+            if item['price'] and item['shipping']:
                 msg += f"🚚 Доставка: {item['shipping']}\n"
-            else:
+            elif item['price'] and not item['shipping']:
                 msg += f"🚚 Доставка: не указана\n"
+            # Если цена не определена, строку доставки вообще не выводим
             if item.get('best_offer', False):
                 msg += f"✅ Сделать предложение (Best Offer)\n"
             if item.get('auction', False):
