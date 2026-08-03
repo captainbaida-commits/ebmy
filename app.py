@@ -858,33 +858,30 @@ def check_and_send_new_items():
         logging.warning("Не удалось загрузить страницу, проверка пропущена")
         return False
     current = parse_ebay_listings(html)
+    # Проверяем, есть ли среди товаров хотя бы один с ценой в USD
+    usd_found = any(item.get('price') is not None for item in current.values())
+    if len(current) > 0 and not usd_found:
+        logging.warning("⚠️ Ни один товар не имеет цены в USD. Сбрасываем прокси и ищем новый...")
+        if fixed_proxy:
+            proxy_manager.mark_bad_proxy(fixed_proxy)
+        fixed_proxy = None
+        fixed_profile = None
+        return False
 
-    # Определяем новые товары
     new = []
     for item_id, data in current.items():
         if item_id not in seen:
             new.append({'id': item_id, **data})
             logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, auction: {data.get('auction')}, has_buy_it_now: {data.get('has_buy_it_now')}")
-
-    # Если есть новые товары, проверяем, есть ли среди них хоть один с ценой USD
-    if new:
-        any_price = any(item.get('price') is not None for item in new)
-        if not any_price:
-            logging.warning("⚠️ Все новые товары не имеют цены в USD. Сбрасываем прокси и ищем новый...")
-            if fixed_proxy:
-                proxy_manager.mark_bad_proxy(fixed_proxy)
-            fixed_proxy = None
-            fixed_profile = None
-            return False
-
     if new:
         for item in new:
             msg = f"🇺🇸 <b>НОВЫЙ ТОВАР США</b> 🇺🇸\n\n<b>{item['title']}</b>\n\n"
+            # Выводим цену только если она определена
             if item['price']:
                 msg += f"💰 Цена: {item['price']}\n"
             else:
                 msg += f"💰 Цена не указана (не USD)\n"
-            # Доставку выводим только если цена определена
+            # Доставку выводим только если цена определена (тогда доставка актуальна)
             if item['price'] and item['shipping']:
                 msg += f"🚚 Доставка: {item['shipping']}\n"
             elif item['price'] and not item['shipping']:
@@ -953,7 +950,7 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот для eBay США запущен. Интервал 40-52 сек, автосмена прокси при отсутствии USD среди новых товаров. Команды /stop /start")
+    send_telegram_message("🚀 Бот для eBay США запущен. Интервал 40-52 сек, автосмена прокси при отсутствии USD. Команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
