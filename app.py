@@ -30,7 +30,7 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "40"))  # не используется, но оставлено
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "20"))  # не используется, но оставлено
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 PROXY_REFRESH_INTERVAL = 5 * 60
@@ -39,7 +39,7 @@ MAX_ITEMS = 20
 MAX_SEARCH_ATTEMPTS = 20
 RETRY_DELAY = 2
 USD_TO_UAH = 45          # курс доллара к гривне
-EXTRA_DELIVERY_COST = 150
+EXTRA_DELIVERY_COST = 160
 
 # Добавляем параметры для США: локация (1 = US), сортировка по новизне, 240 товаров на страницу
 if '?' in EBAY_SEARCH_URL:
@@ -908,7 +908,7 @@ def bot_worker():
         try:
             success = check_and_send_new_items()
             if success:
-                wait = random.uniform(40, 52)
+                wait = random.uniform(20, 32)
                 logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
             else:
                 wait = random.uniform(2, 5)
@@ -927,7 +927,7 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот для eBay США запущен. Интервал 40-52 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот для eBay США запущен. Интервал 20-32 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
