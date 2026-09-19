@@ -63,11 +63,22 @@ DB_MAIN_RETRY_WAIT = max(3.0, float(os.getenv("DB_MAIN_RETRY_WAIT", "8")))
 
 # Render делает zero-downtime deploy: новая и старая копия некоторое время живут одновременно.
 # Один session-level advisory lock в PostgreSQL гарантирует, что фоновые worker-ы активны
-# только в ОДНОЙ копии приложения. Ключ стабильный и не требует таблицы/настроек в Aiven.
+# только в ОДНОЙ копии приложения. ВАЖНО: значение lock-key намеренно сохранено от
+# стабильной UK-версии. Marketplace (UK -> US) НЕ должен менять этот ключ: иначе старая
+# UK-копия и новая US-копия во время zero-downtime deploy могут одновременно стать leader
+# и обе вызвать Telegram getUpdates, что даёт HTTP 409 Conflict и потерю входящих ссылок.
 LEADER_LOCK_KEY = int.from_bytes(
+    hashlib.sha256(b"ebay-uk-telegram-bot-single-leader-v6").digest()[:8],
+    byteorder="big", signed=True,
+)
+# Совместимость с уже развёрнутой ошибочной US v6.27. Новая версия берёт ОБА lock-а
+# на одном PostgreSQL session. Это гарантирует безопасный переход и с UK production,
+# и с US v6.27 без единого окна, когда два Telegram getUpdates listener работают вместе.
+LEADER_LOCK_KEY_US_V627 = int.from_bytes(
     hashlib.sha256(b"ebay-us-telegram-bot-single-leader-v6").digest()[:8],
     byteorder="big", signed=True,
 )
+LEADER_LOCK_KEYS = tuple(dict.fromkeys((LEADER_LOCK_KEY, LEADER_LOCK_KEY_US_V627)))
 LEADER_RETRY_INTERVAL = max(2, int(os.getenv("LEADER_RETRY_INTERVAL", "5")))
 LEADER_HEALTH_INTERVAL = max(5, int(os.getenv("LEADER_HEALTH_INTERVAL", "10")))
 
@@ -3338,18 +3349,28 @@ def is_db_empty():
 
 # ============ SINGLE LEADER ДЛЯ RENDER ============
 def try_acquire_leader_lock():
-    """Возвращает отдельное соединение, которое держит PostgreSQL advisory lock."""
+    """Возвращает session, который держит все migration-safe PostgreSQL advisory locks.
+
+    Два ключа нужны только для бесшовной совместимости: стабильный legacy UK key и
+    ошибочно изменённый US v6.27 key. Закрытие session автоматически освобождает оба.
+    """
     conn = None
     try:
         conn = get_db_connection('ebay_us_leader_lock')
         conn.autocommit = True
+        acquired_all = True
         with conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (LEADER_LOCK_KEY,))
-            acquired = bool(cur.fetchone()[0])
-        if acquired:
+            for lock_key in LEADER_LOCK_KEYS:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+                if not bool(cur.fetchone()[0]):
+                    acquired_all = False
+                    break
+        if acquired_all:
             return conn
     except Exception as e:
         logging.warning(f"Не удалось проверить leader-lock: {e}")
+    # Если хотя бы один key занят другой копией, закрываем session. PostgreSQL при этом
+    # автоматически отпускает все advisory locks, которые мы успели взять в этом session.
     if conn is not None:
         try:
             conn.close()
@@ -7797,7 +7818,15 @@ def auction_reminder_worker():
                     else auction_message_keyboard(item_id, current_url)
                 )
 
-                if send_telegram_message(msg, reply_markup=keyboard, disable_preview=True):
+                # Показываем ту же eBay link-preview карточку/иконку товара, что и в
+                # первом сообщении «Аукцион добавлен». URL остаётся также кликабельным
+                # в тексте и отдельной inline-кнопке.
+                if send_telegram_message(
+                    msg,
+                    reply_markup=keyboard,
+                    preview_url=current_url,
+                    preview_small=True,
+                ):
                     if is_final_five:
                         delete_auction_reminder(item_id)
                         logging.info(f"📨 Auction {item_id}: отправлено финальное reminder 5 мин; запись удалена")
@@ -7847,8 +7876,22 @@ def telegram_listener():
             params = {'offset': last_update_id + 1, 'timeout': 30}
             r = requests.get(url, params=params, timeout=35)
             if r.status_code != 200:
-                logging.warning(f"Telegram getUpdates HTTP {r.status_code}: {r.text[:300]}")
-                time.sleep(3)
+                # Telegram разрешает только один long-poll getUpdates на один bot token.
+                # HTTP 409 означает, что где-то ещё жив второй poller. После фикса общего
+                # PostgreSQL leader-lock это не должно происходить между соседними Render
+                # deploy одного сервиса. Если 409 всё же пришёл (например, запущен другой
+                # Render service с тем же TOKEN), не устраиваем взаимное «выбивание» запросов
+                # каждые 3 секунды: даём второму long-poll завершиться и пробуем снова.
+                if r.status_code == 409:
+                    logging.error(
+                        "⚠️ Telegram getUpdates 409 Conflict: обнаружен другой poller с тем же "
+                        "TELEGRAM_BOT_TOKEN. Ждём 35 сек. перед повтором; проверьте, что старый/"
+                        "другой Render service с этим token остановлен."
+                    )
+                    time.sleep(35)
+                else:
+                    logging.warning(f"Telegram getUpdates HTTP {r.status_code}: {r.text[:300]}")
+                    time.sleep(3)
                 continue
 
             updates = r.json().get('result', [])
@@ -10203,7 +10246,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.27 AdaptiveFastAuction, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.28 AuctionReminderFix, {role})"
 
 
 @app.route('/health')
