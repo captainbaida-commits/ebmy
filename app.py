@@ -61,6 +61,18 @@ DB_CONNECT_ATTEMPTS = max(1, min(int(os.getenv("DB_CONNECT_ATTEMPTS", "3")), 5))
 DB_CONNECT_RETRY_BASE = max(0.10, float(os.getenv("DB_CONNECT_RETRY_BASE", "0.35")))
 DB_MAIN_RETRY_WAIT = max(3.0, float(os.getenv("DB_MAIN_RETRY_WAIT", "8")))
 
+# V6.30: persist only SAFE metadata for the most recently proven main proxy.
+# Render zero-downtime deploys start a fresh Python process, so RAM-only reputation is lost.
+# A short one-shot restart probe can recover the exact last-good endpoint before broad discovery.
+# Credentials are NEVER written to PostgreSQL: managed providers are resolved back to their
+# current authenticated URL from the fresh provider API snapshot by host/port.
+RESTART_STICKY_PROXY_ENABLED = os.getenv("RESTART_STICKY_PROXY_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+RESTART_STICKY_PROXY_MAX_AGE = max(300, int(os.getenv("RESTART_STICKY_PROXY_MAX_AGE", str(12 * 3600))))
+RESTART_STICKY_PROXY_REFRESH = max(120, int(os.getenv("RESTART_STICKY_PROXY_REFRESH", "600")))
+RESTART_STICKY_CONNECT_TIMEOUT = max(1.5, min(float(os.getenv("RESTART_STICKY_CONNECT_TIMEOUT", "3.5")), 5.0))
+RESTART_STICKY_READ_TIMEOUT = max(4.0, min(float(os.getenv("RESTART_STICKY_READ_TIMEOUT", "7.0")), 10.0))
+RESTART_STICKY_STATE_KEY = "main_restart_sticky_proxy_v1"
+
 # Render делает zero-downtime deploy: новая и старая копия некоторое время живут одновременно.
 # Один session-level advisory lock в PostgreSQL гарантирует, что фоновые worker-ы активны
 # только в ОДНОЙ копии приложения. ВАЖНО: значение lock-key намеренно сохранено от
@@ -155,6 +167,11 @@ PROXY_STANDARD_MID_REFRESH_ATTEMPTS = max(30, int(os.getenv("PROXY_STANDARD_MID_
 # Если eBay США не дал ни одного успешного ответа более 10 минут, один раз
 # уведомляем в Telegram. После следующего успеха аварийный флаг сбрасывается.
 CONNECTION_ALERT_AFTER = max(60, int(os.getenv("CONNECTION_ALERT_AFTER", "600")))
+# V6.28: log the TOTAL interval between valid eBay HTTP 200 responses after a meaningful
+# outage. Per-discovery timings alone hide multi-cycle outages (e.g. 4x75s + retries).
+CONNECTION_RECOVERY_LOG_AFTER = max(
+    45, int(os.getenv("CONNECTION_RECOVERY_LOG_AFTER", "60"))
+)
 CONNECTION_WATCHDOG_INTERVAL = max(10, int(os.getenv("CONNECTION_WATCHDOG_INTERVAL", "15")))
 
 # ============ НАПОМИНАНИЯ ОБ АУКЦИОНАХ ============
@@ -358,6 +375,16 @@ WEBSHARE_HANDOFF_CONFIRMATIONS = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONF
 WEBSHARE_HANDOFF_CONFIRM_DELAY = max(1.0, float(os.getenv("WEBSHARE_HANDOFF_CONFIRM_DELAY", "10")))
 WEBSHARE_HANDOFF_READY_TTL = max(30.0, float(os.getenv("WEBSHARE_HANDOFF_READY_TTL", "90")))
 MANAGED_PROVIDER_CIRCUIT_SECONDS = max(120, int(os.getenv("MANAGED_PROVIDER_CIRCUIT_SECONDS", "300")))
+# V6.28: keep the full provider circuit as a safety net, but do not make a healthy
+# Webshare pool disappear for the whole 5 minutes. During a shared-pool circuit we allow
+# one controlled half-open probe after 60s and then at most once per 60s. A success closes
+# the circuit immediately; another 403 simply leaves the circuit in place.
+WEBSHARE_CIRCUIT_HALF_OPEN_AFTER = max(
+    30.0, float(os.getenv("WEBSHARE_CIRCUIT_HALF_OPEN_AFTER", "60"))
+)
+WEBSHARE_CIRCUIT_HALF_OPEN_INTERVAL = max(
+    30.0, float(os.getenv("WEBSHARE_CIRCUIT_HALF_OPEN_INTERVAL", "60"))
+)
 # V6.23: current production log showed a correlated 403 wall: all Webshare addresses
 # from one account were consumed almost back-to-back, then dozens of Premium IPs were
 # probed before its 32-block circuit opened. Account-level Webshare circuit protects
@@ -389,7 +416,7 @@ PROVIDER_STATS_INTERVAL = max(60, int(os.getenv("PROVIDER_STATS_INTERVAL", "300"
 
 # Память outage живёт между соседними 75-секундными discovery. Ранее проверенные неизвестные
 # IP не исчезают из пула, но новые IP идут раньше. Known-good всё ещё может получить controlled retry.
-OUTAGE_HOST_MEMORY = max(90, int(os.getenv("OUTAGE_HOST_MEMORY", "240")))
+OUTAGE_HOST_MEMORY = max(180, int(os.getenv("OUTAGE_HOST_MEMORY", "600")))
 # 403/challenge на auction URL не должен жёстко банить основной monitor, но на короткое время
 # понижает приоритет того же exit IP для другой eBay-поверхности.
 EBAY_CROSS_SOFT_PENALTY = max(30, int(os.getenv("EBAY_CROSS_SOFT_PENALTY", "120")))
@@ -645,10 +672,17 @@ def record_ebay_success():
     global last_ebay_success_at, connection_alert_sent
     now = time.monotonic()
     with connection_state_lock:
-        first_success = last_ebay_success_at is None
+        previous_success_at = last_ebay_success_at
+        first_success = previous_success_at is None
         was_alerted = connection_alert_sent
+        recovery_gap = (now - previous_success_at) if previous_success_at is not None else None
         last_ebay_success_at = now
         connection_alert_sent = False
+    if recovery_gap is not None and recovery_gap >= CONNECTION_RECOVERY_LOG_AFTER:
+        logging.info(
+            f"🔄 eBay связь восстановлена: между валидными HTTP 200 прошло "
+            f"{recovery_gap:.1f} сек. ({recovery_gap / 60.0:.1f} мин.)"
+        )
     # После deploy/долгого outage не ждём до 60 сек. status-tick: если в PostgreSQL
     # уже есть due pending-аукцион, worker сразу получит шанс его уточнить. На обычных
     # успешных циклах event не ставится, поэтому лишнего DB polling нет.
@@ -770,6 +804,8 @@ class ProviderManager:
         # from immediately retrying the same blocked provider pool after key #1 hits a 403 wall.
         self.webshare_pool_recent = deque(maxlen=12)
         self.webshare_pool_circuit_until = 0.0
+        self.webshare_pool_circuit_opened_at = 0.0
+        self.webshare_pool_half_open_last = 0.0
 
         self.webshare_accounts = {}
         for idx, key in enumerate(WEBSHARE_API_KEYS, 1):
@@ -1308,6 +1344,72 @@ class ProviderManager:
             buckets = next_buckets
         return out
 
+    def webshare_half_open_snapshot(self):
+        """Return Webshare endpoints while the shared circuit is open, without consuming a probe slot.
+
+        This is used only by the main discovery half-open path. Normal candidate APIs still
+        respect the shared circuit and return no Webshare endpoints during it.
+        """
+        now = time.time()
+        with self.lock:
+            if self.webshare_pool_circuit_until <= now:
+                return []
+            opened = self.webshare_pool_circuit_opened_at or (
+                self.webshare_pool_circuit_until - MANAGED_PROVIDER_CIRCUIT_SECONDS
+            )
+            if (now - opened) < WEBSHARE_CIRCUIT_HALF_OPEN_AFTER:
+                return []
+            if self.webshare_pool_half_open_last and (
+                now - self.webshare_pool_half_open_last
+            ) < WEBSHARE_CIRCUIT_HALF_OPEN_INTERVAL:
+                return []
+
+            accounts = []
+            for idx, state in self.webshare_accounts.items():
+                if state.get('api_disabled_until', 0.0) > now or state.get('circuit_until', 0.0) > now:
+                    continue
+                ratio = self._webshare_usage_ratio_locked(idx)
+                if ratio is not None and ratio >= WEBSHARE_USAGE_HARD_LIMIT:
+                    continue
+                if state.get('proxies'):
+                    accounts.append((idx, ratio if ratio is not None else 0.50, list(state['proxies'])))
+            accounts.sort(key=lambda row: (row[1], row[0]))
+
+            out = []
+            for idx, _ratio, rows in accounts:
+                random.shuffle(rows)
+                out.extend(rows)
+            return out
+
+    def claim_webshare_half_open(self):
+        """Atomically reserve the current half-open opportunity for one discovery probe."""
+        now = time.time()
+        with self.lock:
+            if self.webshare_pool_circuit_until <= now:
+                return False
+            opened = self.webshare_pool_circuit_opened_at or (
+                self.webshare_pool_circuit_until - MANAGED_PROVIDER_CIRCUIT_SECONDS
+            )
+            if (now - opened) < WEBSHARE_CIRCUIT_HALF_OPEN_AFTER:
+                return False
+            if self.webshare_pool_half_open_last and (
+                now - self.webshare_pool_half_open_last
+            ) < WEBSHARE_CIRCUIT_HALF_OPEN_INTERVAL:
+                return False
+            self.webshare_pool_half_open_last = now
+            return True
+
+    def _close_webshare_shared_circuit_locked(self):
+        now = time.time()
+        if self.webshare_pool_circuit_until <= now:
+            return False
+        self.webshare_pool_circuit_until = 0.0
+        self.webshare_pool_circuit_opened_at = 0.0
+        self.webshare_pool_half_open_last = 0.0
+        self.webshare_pool_recent.clear()
+        self.webshare_pool_recent.append('success')
+        return True
+
     def candidates(self, include_webshare=False):
         now = time.time()
         with self.lock:
@@ -1481,8 +1583,13 @@ class ProviderManager:
                 ):
                     until = now + MANAGED_PROVIDER_CIRCUIT_SECONDS
                     if shared_pool:
-                        if self.webshare_pool_circuit_until < until - 1:
+                        # Do not keep extending an already-open shared circuit because
+                        # of late in-flight 403s from the same wave. Open it once, then
+                        # let controlled half-open probes test whether the pool recovered.
+                        if self.webshare_pool_circuit_until <= now:
                             self.webshare_pool_circuit_until = until
+                            self.webshare_pool_circuit_opened_at = now
+                            self.webshare_pool_half_open_last = 0.0
                             return 'Webshare shared exit pool'
                     elif state['circuit_until'] < until - 1:
                         state['circuit_until'] = until
@@ -1494,6 +1601,7 @@ class ProviderManager:
         if src not in self.stats:
             src = 'free'
         circuit_label = None
+        webshare_circuit_closed = False
         with self.lock:
             st = self.stats[src]
             st['requests'] += 1
@@ -1535,9 +1643,16 @@ class ProviderManager:
                             state['discovery_success'] += 1
                     if result == 'success':
                         self._bounded_seen_add(state['unique_success'], proxy)
+                        # A successful controlled half-open (or any discovery success that
+                        # somehow arrives while the shared circuit is still active) proves
+                        # the exit pool recovered. Re-open Webshare immediately instead of
+                        # waiting for the original 5-minute timer.
+                        webshare_circuit_closed = self._close_webshare_shared_circuit_locked()
 
             circuit_label = self._update_managed_circuit_locked(proxy, result, request_kind)
 
+        if webshare_circuit_closed:
+            logging.info("🟢 Webshare shared exit pool recovered; circuit closed early after HTTP 200")
         if circuit_label:
             logging.warning(
                 f"🛑 {circuit_label}: temporary 403 circuit opened; "
@@ -2550,6 +2665,40 @@ class ProxyManager:
         rows = self.get_webshare_rescue_candidates(1, excluded_hosts=excluded_hosts)
         return rows[0] if rows else None
 
+    def get_webshare_half_open_candidate(self, excluded_hosts=None):
+        """One controlled Webshare retry while the shared 403 circuit is still open.
+
+        The provider circuit remains the default. This path is intentionally tiny: at most
+        one endpoint per half-open interval, and normal proxy/host cooldowns still apply.
+        """
+        excluded_hosts = set(excluded_hosts or ())
+        raw = provider_manager.webshare_half_open_snapshot()
+        if not raw:
+            return None
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            rows = []
+            for proxy in raw:
+                host = _proxy_host(proxy)
+                if not host or host in excluded_hosts:
+                    continue
+                if self.bad_until.get(proxy, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self.soft_host_penalty_until.get(host, 0) > now:
+                    continue
+                rows.append(proxy)
+            if not rows:
+                return None
+            rows.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            chosen = rows[0]
+
+        if not provider_manager.claim_webshare_half_open():
+            return None
+        with self.lock:
+            self.last_used[chosen] = now
+        return chosen
+
     def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None, allow_webshare=False):
         """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
 
@@ -2623,12 +2772,17 @@ class ProxyManager:
                 quality_state = self._quality_state_locked(p, now)
                 tcp_state = self._preflight_state_locked(p, now)
 
-                if quality_state == 'ok' and not soft_penalized:
-                    quality_usable.append(p)
-                elif tcp_state == 'ok' and quality_state != 'bad' and not soft_penalized:
-                    tcp_usable.append(p)
-                elif soft_penalized or recent_outage_unknown or quality_state == 'bad':
+                # V6.28: a proxy that already failed eBay during the SAME outage must not
+                # jump back ahead merely because TCP/TLS preflight still says "ready".
+                # Preflight proves transport only; the real eBay result is stronger evidence.
+                # Keep recently-good proxies exempt, and keep recycled endpoints available as
+                # a fallback after fresh candidates are exhausted.
+                if soft_penalized or recent_outage_unknown or quality_state == 'bad':
                     recycled_usable.append(p)
+                elif quality_state == 'ok':
+                    quality_usable.append(p)
+                elif tcp_state == 'ok':
+                    tcp_usable.append(p)
                 else:
                     fresh_usable.append(p)
 
@@ -3076,6 +3230,16 @@ fixed_profile = None
 fixed_session = None
 fixed_pair_since_monotonic = None
 
+# Durable restart-sticky proxy state. Only one candidate is tried at cold leader start;
+# a stale/dead endpoint can therefore cost only one short request before normal discovery.
+restart_sticky_lock = threading.Lock()
+restart_sticky_candidate = None
+restart_sticky_consumed = False
+restart_sticky_last_queued_identity = None
+restart_sticky_last_queued_at = 0.0
+restart_sticky_pending_record = None
+restart_sticky_persist_event = threading.Event()
+
 # V6.22 make-before-break: while a metered Webshare fixed session keeps the monitor
 # continuously online, a separate worker scouts FREE proxies. A replacement is adopted
 # only after it already returned a valid eBay HTTP 200 in its own Session.
@@ -3266,6 +3430,168 @@ def set_bot_state(key, value):
                 (key, str(value)),
             )
         conn.commit()
+
+
+def _restart_sticky_safe_record(proxy):
+    """Build credential-free metadata for PostgreSQL. Never persist user:password."""
+    if not proxy:
+        return None
+    try:
+        parts = urlsplit(proxy)
+        host = (parts.hostname or '').strip().lower()
+        port = parts.port
+        scheme = (parts.scheme or 'http').lower()
+        if not host or port is None or scheme not in ('http', 'https', 'socks5'):
+            return None
+        source = provider_manager.source_fast(proxy) if 'provider_manager' in globals() else 'free'
+        if source not in ('free', 'proxyscrape_premium', 'webshare'):
+            source = 'free'
+        return {
+            'v': 1,
+            'scheme': scheme,
+            'host': host,
+            'port': int(port),
+            'source': source,
+            'saved_at': time.time(),
+        }
+    except Exception:
+        return None
+
+
+def _restart_sticky_identity(record):
+    if not record:
+        return None
+    return (
+        str(record.get('source') or 'free'),
+        str(record.get('scheme') or 'http'),
+        str(record.get('host') or '').lower(),
+        int(record.get('port') or 0),
+    )
+
+
+def _queue_restart_sticky_persist(proxy, force=False):
+    """Non-blocking persistence: main eBay cycle never waits on Aiven for this optimization."""
+    global restart_sticky_last_queued_identity, restart_sticky_last_queued_at, restart_sticky_pending_record
+    if not RESTART_STICKY_PROXY_ENABLED:
+        return
+    record = _restart_sticky_safe_record(proxy)
+    if not record:
+        return
+    ident = _restart_sticky_identity(record)
+    now_mono = time.monotonic()
+    with restart_sticky_lock:
+        if (
+            not force
+            and ident == restart_sticky_last_queued_identity
+            and (now_mono - restart_sticky_last_queued_at) < RESTART_STICKY_PROXY_REFRESH
+        ):
+            return
+        restart_sticky_last_queued_identity = ident
+        restart_sticky_last_queued_at = now_mono
+        restart_sticky_pending_record = record
+    restart_sticky_persist_event.set()
+
+
+def restart_sticky_persist_worker():
+    """Persist latest safe proxy metadata without ever blocking the main monitor."""
+    global restart_sticky_pending_record
+    db_ready_event.wait()
+    while True:
+        restart_sticky_persist_event.wait(timeout=30)
+        restart_sticky_persist_event.clear()
+        with restart_sticky_lock:
+            record = restart_sticky_pending_record
+            restart_sticky_pending_record = None
+        if not record:
+            continue
+        try:
+            set_bot_state(RESTART_STICKY_STATE_KEY, json.dumps(record, separators=(',', ':')))
+            logging.info(
+                f"💾 Restart-sticky saved: {record['scheme']}://{record['host']}:{record['port']} "
+                f"[{record['source']}]"
+            )
+        except Exception as e:
+            logging.warning(f"⚠️ Не удалось сохранить restart-sticky proxy в Aiven: {e}")
+            # Keep the newest pending value. If another success arrived meanwhile, do not overwrite it.
+            with restart_sticky_lock:
+                if restart_sticky_pending_record is None:
+                    restart_sticky_pending_record = record
+            restart_sticky_persist_event.wait(timeout=10)
+            restart_sticky_persist_event.set()
+
+
+def _load_restart_sticky_candidate():
+    """Load one credential-free candidate from PostgreSQL for the next cold-start probe."""
+    global restart_sticky_candidate, restart_sticky_consumed
+    restart_sticky_candidate = None
+    restart_sticky_consumed = False
+    if not RESTART_STICKY_PROXY_ENABLED:
+        return None
+    try:
+        raw = get_bot_state(RESTART_STICKY_STATE_KEY)
+        if not raw:
+            logging.info("♻️ Restart-sticky: сохранённого last-good proxy пока нет")
+            return None
+        record = json.loads(raw)
+        if not isinstance(record, dict) or int(record.get('v', 0)) != 1:
+            return None
+        ident = _restart_sticky_identity(record)
+        if not ident or not ident[2] or ident[3] <= 0:
+            return None
+        age = max(0.0, time.time() - float(record.get('saved_at') or 0.0))
+        if age > RESTART_STICKY_PROXY_MAX_AGE:
+            logging.info(
+                f"♻️ Restart-sticky: запись устарела ({age/3600:.1f} ч.); обычный discovery"
+            )
+            return None
+        restart_sticky_candidate = record
+        logging.info(
+            f"♻️ Restart-sticky loaded: {record.get('scheme','http')}://{record.get('host')}:{record.get('port')} "
+            f"[{record.get('source','free')}], age={age:.0f}s; будет проверен первым"
+        )
+        return record
+    except Exception as e:
+        logging.warning(f"⚠️ Не удалось загрузить restart-sticky proxy: {e}; обычный discovery")
+        return None
+
+
+def _resolve_restart_sticky_proxy(record):
+    """Resolve safe DB metadata to a current proxy URL; credentials stay only in provider memory."""
+    if not record:
+        return None
+    try:
+        source = str(record.get('source') or 'free')
+        scheme = str(record.get('scheme') or 'http').lower()
+        host = str(record.get('host') or '').lower()
+        port = int(record.get('port') or 0)
+        if not host or port <= 0:
+            return None
+        if source == 'free':
+            return f"{scheme}://{host}:{port}"
+
+        # Managed endpoints need fresh credentials. Never reconstruct or persist them ourselves.
+        rows = provider_manager.candidates(include_webshare=True)
+        for proxy in rows:
+            if provider_manager.source_fast(proxy) != source:
+                continue
+            try:
+                p = urlsplit(proxy)
+                if (p.hostname or '').lower() == host and int(p.port or 0) == port:
+                    return proxy
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _consume_restart_sticky_candidate():
+    global restart_sticky_consumed
+    with restart_sticky_lock:
+        if restart_sticky_consumed or restart_sticky_candidate is None:
+            return None
+        restart_sticky_consumed = True
+        return dict(restart_sticky_candidate)
 
 
 def initialize_seen_count_cache():
@@ -4220,6 +4546,7 @@ def get_auctions_for_status_check(limit=100):
                 SELECT item_id, url, title, end_time_utc, last_status_check
                 FROM auction_reminders
                 WHERE end_time_utc > NOW()
+                  AND end_time_utc <= NOW() + INTERVAL '24 hours'
                 ORDER BY end_time_utc ASC,
                          COALESCE(last_status_check, TIMESTAMPTZ '1970-01-01') ASC
                 LIMIT %s
@@ -4230,21 +4557,30 @@ def get_auctions_for_status_check(limit=100):
 
 
 def _status_check_interval_seconds(remaining):
-    # После 5-минутного reminder запись удаляется, поэтому сверхчастые проверки
-    # в последние минуты больше не нужны. До этого момента контроль остаётся лёгким.
+    """Network re-check cadence for already exact auctions.
+
+    Reminders themselves are DB/time driven and do not require an eBay fetch.  We therefore
+    never poll exact auctions while they are >24h away, and keep only a progressively tighter
+    verification cadence inside the final 24h.  Pending/coarse auctions have their own
+    refinement scheduler and are intentionally unchanged.
+    """
     if remaining <= 5 * 60:
         return None
     if remaining <= 10 * 60:
-        return 120
+        return 120          # final validation window
     if remaining <= 30 * 60:
         return 300
     if remaining <= 60 * 60:
         return 600
+    if remaining <= 2 * 3600:
+        return 1200         # every 20 min
     if remaining <= 6 * 3600:
-        return 900
+        return 3600         # every hour
+    if remaining <= 12 * 3600:
+        return 7200         # every 2 hours
     if remaining <= 24 * 3600:
-        return 1800
-    return 3600
+        return 10800        # every 3 hours
+    return None
 
 
 def _reminder_column(minutes):
@@ -4521,6 +4857,22 @@ def auction_message_keyboard(item_id, url, include_list=False):
 
 def auction_list_only_keyboard():
     return {'inline_keyboard': [[{'text': '📋 Все аукционы', 'callback_data': 'auclist'}]]}
+
+
+def bot_main_reply_keyboard():
+    """Persistent Telegram keyboard next to the message input.
+
+    Telegram reply-keyboard buttons send their visible text as a normal message, so the
+    listener maps "📋 Аукционы" to the exact same handler as /auctions.  Inline keyboards
+    on individual auction messages can coexist with this persistent chat keyboard.
+    """
+    return {
+        'keyboard': [[{'text': '📋 Аукционы'}]],
+        'resize_keyboard': True,
+        'one_time_keyboard': False,
+        'is_persistent': True,
+        'input_field_placeholder': 'Отправьте ссылку eBay или откройте аукционы',
+    }
 
 
 def auction_queue_keyboard(url):
@@ -7920,9 +8272,13 @@ def telegram_listener():
                             elif text == '/start':
                                 is_paused = False
                                 reset_connection_watch_after_manual_resume()
-                                send_telegram_message("▶ Основной мониторинг продолжает работу")
+                                send_telegram_message(
+                                    "▶ Основной мониторинг продолжает работу",
+                                    reply_markup=bot_main_reply_keyboard(),
+                                )
                                 logging.info("Команда /start - продолжение; watchdog-таймер перезапущен")
-                            elif text in ('/auctions', '/list'):
+                            elif text in ('/auctions', '/list', '📋 Аукционы', 'Аукционы'):
+                                # Persistent button and slash command deliberately share one handler.
                                 send_auction_list()
                             elif text.startswith('/delauction'):
                                 parts = text.split(maxsplit=1)
@@ -8547,6 +8903,7 @@ def _adopt_webshare_handoff_if_ready():
             "metered Webshare traffic stopped without an outage"
         )
         wake_queued_auctions_for_new_fixed()
+        _queue_restart_sticky_persist(proxy, force=True)
         return True
     close_session(session)
     return False
@@ -8738,6 +9095,7 @@ def fetch_ebay_html_with_fixed_pair():
             fixed_session = returned_session
             proxy_manager.mark_success(old_proxy)
             record_ebay_success()
+            _queue_restart_sticky_persist(old_proxy, force=False)
             return html
 
         # Частая реальная ситуация: умерло только старое TCP/TLS соединение Session,
@@ -8778,6 +9136,7 @@ def fetch_ebay_html_with_fixed_pair():
                     fixed_pair_since_monotonic = time.monotonic()
                 proxy_manager.mark_success(old_proxy)
                 record_ebay_success()
+                _queue_restart_sticky_persist(old_proxy, force=True)
                 logging.info("✅ Proxy восстановился после пересоздания session")
                 return retry_html
 
@@ -8841,6 +9200,65 @@ def fetch_ebay_html_with_fixed_pair():
     # (timeout=1500). Emergency 3000 не имеет права включаться на пустом 0/0 pool.
     if not proxy_manager.standard_pool_loaded():
         proxy_manager.refresh_proxies(force=True, emergency=False)
+
+    # V6.30: on a fresh leader process, try the exact last eBay-proven endpoint ONCE
+    # before broad discovery. Render deploys discard RAM state, but the old process may
+    # have confirmed this proxy only seconds earlier. A dead/stale candidate gets only a
+    # short bounded attempt and then normal 4→5→6 discovery proceeds unchanged.
+    sticky_record = _consume_restart_sticky_candidate()
+    if sticky_record is not None:
+        sticky_proxy = _resolve_restart_sticky_proxy(sticky_record)
+        sticky_profile = get_preferred_profile()
+        if sticky_proxy is None:
+            logging.info(
+                "♻️ Restart-sticky: managed endpoint больше не доступен в свежем provider snapshot; "
+                "переходим к обычному discovery"
+            )
+        elif sticky_profile is None:
+            logging.warning("♻️ Restart-sticky: нет поддерживаемого browser-profile; обычный discovery")
+        else:
+            sticky_started = time.monotonic()
+            logging.info(
+                f"♻️ Restart-sticky FIRST: проверяем последний eBay-good proxy "
+                f"{_proxy_log_name(sticky_proxy)} перед новым discovery"
+            )
+            with main_fixed_request_lock:
+                sticky_result, sticky_html, sticky_session = _make_request(
+                    sticky_proxy,
+                    sticky_profile,
+                    session=None,
+                    timeout=(RESTART_STICKY_CONNECT_TIMEOUT, RESTART_STICKY_READ_TIMEOUT),
+                    request_kind='recovery',
+                )
+            sticky_elapsed = time.monotonic() - sticky_started
+            if sticky_result == 'success':
+                fixed_proxy = sticky_proxy
+                fixed_profile = sticky_profile
+                fixed_session = sticky_session
+                fixed_pair_since_monotonic = time.monotonic()
+                proxy_manager.mark_success(sticky_proxy)
+                proxy_manager.clear_outage_memory()
+                record_ebay_success()
+                _queue_restart_sticky_persist(sticky_proxy, force=True)
+                proxy_preflight_wakeup_event.set()
+                wake_queued_auctions_for_new_fixed()
+                if provider_manager.source_fast(sticky_proxy) == 'webshare':
+                    webshare_handoff_wakeup_event.set()
+                logging.info(
+                    f"✅ Restart-sticky восстановлен за {sticky_elapsed:.1f} сек.: "
+                    f"{_proxy_log_name(sticky_proxy)}; широкий discovery не понадобился"
+                )
+                return sticky_html
+            close_session(sticky_session)
+            if sticky_result != 'profile_error':
+                proxy_manager.mark_failure(
+                    sticky_proxy, sticky_result, reason=f'restart-sticky {sticky_result}'
+                )
+                _auction_proxy_soft_host_penalty(sticky_proxy, sticky_result)
+            logging.info(
+                f"♻️ Restart-sticky не подтвердился ({sticky_result}) за {sticky_elapsed:.1f} сек.; "
+                "сразу запускаем обычный discovery"
+            )
 
     started = time.monotonic()
     tried_hosts = set()
@@ -9038,6 +9456,25 @@ def fetch_ebay_html_with_fixed_pair():
                         break
                     batch.append(ws_rescue)
                     batch_kinds[ws_rescue] = 'Webshare bridge'
+
+            # V6.28: while the shared Webshare 403-circuit is active, allow exactly one
+            # controlled half-open probe roughly once per minute. This is intentionally
+            # independent from normal Webshare availability: the whole point is to detect
+            # recovery before the full 5-minute circuit expires.
+            if len(batch) < need:
+                ws_half_open = proxy_manager.get_webshare_half_open_candidate(
+                    excluded_hosts=(
+                        tried_hosts
+                        | inflight_hosts
+                        | {_proxy_host(p) for p in batch}
+                    ),
+                )
+                if ws_half_open is not None:
+                    batch.append(ws_half_open)
+                    batch_kinds[ws_half_open] = 'Webshare half-open'
+                    logging.info(
+                        f"🟡 Webshare half-open recovery probe: {_proxy_log_name(ws_half_open)}"
+                    )
 
             # Fill the remaining first-wave workers from already proven warm reserve.
             while fast_standby_queue and len(batch) < need:
@@ -9268,6 +9705,7 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_session = winner_session
                 fixed_pair_since_monotonic = time.monotonic()
                 record_ebay_success()
+                _queue_restart_sticky_persist(winner_proxy, force=True)
                 proxy_preflight_wakeup_event.set()
                 # A newly proven Session is also a new chance for durable auction jobs.
                 # Do not leave them sleeping behind an old 30/60-second retry deadline.
@@ -9448,13 +9886,27 @@ def extract_price_jsonld(card, url=None, soup=None):
 
 
 def extract_price_css(card):
+    """Extract the CURRENT displayed US price from one eBay result card.
+
+    eBay's new ``s-card`` layout can contain several elements whose class includes
+    the word ``price`` (current, previous/strikethrough, unit/discount, etc.).
+    The old broad fallback could therefore return a visually secondary amount.
+    Prefer exact primary-price selectors first and use the broad fallback only after
+    rejecting known secondary-price containers.
+    """
     range_price = extract_range_price(card)
     if range_price:
         return range_price
 
-    selectors = ['span.s-item__price', '[data-testid="item-price"]', '.s-item__detail .s-item__price']
+    primary_selectors = [
+        'span.s-card__price',
+        '.s-card__price',
+        'span.s-item__price',
+        '[data-testid="item-price"]',
+        '.s-item__detail .s-item__price',
+    ]
     seen = set()
-    for sel in selectors + ['[class*="price"]']:
+    for sel in primary_selectors:
         for elem in card.select(sel):
             text = elem.get_text(' ', strip=True)
             if not text or text in seen:
@@ -9463,6 +9915,24 @@ def extract_price_css(card):
             amount = _extract_usd_amount(text)
             if amount:
                 return amount
+
+    # Last-resort compatibility for an unknown future layout.  Do not accept
+    # obvious old/original/unit/discount/shipping values as the item's main price.
+    secondary_tokens = (
+        'original', 'strikethrough', 'strike', 'was-price', 'wasprice',
+        'unit-price', 'unitprice', 'discount', 'savings', 'shipping', 'delivery',
+    )
+    for elem in card.select('[class*="price"]'):
+        classes = ' '.join(elem.get('class') or []).lower()
+        if any(token in classes for token in secondary_tokens):
+            continue
+        text = elem.get_text(' ', strip=True)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        amount = _extract_usd_amount(text)
+        if amount:
+            return amount
     return None
 
 
@@ -9560,6 +10030,172 @@ def extract_shipping(card, item_price=None, range_prices=None):
     if match:
         return match.group(1).strip()
     return None
+
+def _iter_json_nodes(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_json_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_json_nodes(child)
+
+
+def _parse_us_item_detail_price_shipping(html, expected_item_id=None):
+    """Return strongly verified (price, shipping) from an eBay US item page.
+
+    This parser intentionally ignores generic monetary text.  A detail page contains
+    many unrelated amounts (financing, coupons, crossed-out prices, other variants),
+    so only Product/Offer JSON-LD or explicit primary-price/shipping UI blocks are used.
+    """
+    if not html:
+        return None, None
+    soup = BeautifulSoup(html, 'html.parser')
+    try:
+        json_prices = []
+        for script in soup.find_all('script', type='application/ld+json'):
+            raw = script.string or script.get_text('', strip=True)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            for node in _iter_json_nodes(data):
+                offers = node.get('offers')
+                offer_rows = offers if isinstance(offers, list) else [offers] if isinstance(offers, dict) else []
+                for offer in offer_rows:
+                    if not isinstance(offer, dict):
+                        continue
+                    currency = str(offer.get('priceCurrency') or '').upper()
+                    price = offer.get('price')
+                    if currency == 'USD' and price not in (None, '', 0, '0'):
+                        try:
+                            val = float(str(price).replace(',', ''))
+                        except Exception:
+                            continue
+                        if val > 0:
+                            json_prices.append(val)
+
+        # Use JSON-LD only when it resolves to one unambiguous USD amount.
+        uniq = sorted({round(v, 2) for v in json_prices})
+        verified_price = f"${uniq[0]:.2f}" if len(uniq) == 1 else None
+
+        if verified_price is None:
+            primary_selectors = [
+                'div.x-price-primary span.ux-textspans',
+                '.x-price-primary .ux-textspans',
+                '[data-testid="x-price-primary"]',
+                '[data-testid="x-price-primary"] .ux-textspans',
+                'meta[itemprop="price"]',
+            ]
+            for sel in primary_selectors:
+                for elem in soup.select(sel):
+                    if elem.name == 'meta':
+                        content = elem.get('content') or ''
+                        try:
+                            val = float(str(content).replace(',', ''))
+                        except Exception:
+                            continue
+                        if val > 0:
+                            verified_price = f"${val:.2f}"
+                            break
+                    amount = _extract_usd_amount(elem.get_text(' ', strip=True))
+                    if amount:
+                        verified_price = amount
+                        break
+                if verified_price:
+                    break
+
+        verified_shipping = None
+        shipping_selectors = [
+            '.ux-labels-values--shipping',
+            '[data-testid*="shipping"]',
+            '[class*="shipping"]',
+        ]
+        for sel in shipping_selectors:
+            for elem in soup.select(sel):
+                text = re.sub(r'\s+', ' ', elem.get_text(' ', strip=True)).strip()
+                low = text.lower()
+                if not text or 'shipping' not in low and 'delivery' not in low and sel == '[class*="shipping"]':
+                    continue
+                if re.search(r'\bfree\b', low):
+                    verified_shipping = 'Бесплатно'
+                    break
+                amount = _extract_usd_amount(text)
+                if amount:
+                    verified_shipping = amount
+                    break
+            if verified_shipping:
+                break
+
+        return verified_price, verified_shipping
+    finally:
+        try:
+            soup.decompose()
+        except Exception:
+            pass
+
+
+def _verify_new_item_price_shipping(item):
+    """One best-effort detail-page verification for a newly discovered item only.
+
+    It reuses the already proven fixed Session and does NOT trigger proxy discovery.
+    If verification fails, the search-card values are left unchanged.  This adds no
+    extra traffic to the normal 60-card polling loop; only genuinely new items pay one
+    additional item-page request before Telegram notification.
+    """
+    global fixed_session
+    url = str(item.get('url') or '')
+    item_id = str(item.get('id') or '')
+    if not url or not item_id or fixed_session is None:
+        return item
+
+    html = None
+    final_url = ''
+    try:
+        with main_fixed_request_lock:
+            session = fixed_session
+            if session is None:
+                return item
+            response = session.get(url, timeout=(4, 10), allow_redirects=True)
+            if response.status_code != 200:
+                logging.info(f"🔎 Price verify [{item_id}] skipped: HTTP {response.status_code}")
+                return item
+            html = response.text or ''
+            final_url = str(getattr(response, 'url', '') or '')
+        low = html[:250000].lower()
+        if 'pardon our interruption' in low or '/splashui/challenge' in final_url.lower():
+            logging.info(f"🔎 Price verify [{item_id}] skipped: eBay challenge")
+            return item
+        final_id = extract_item_id(final_url) if final_url else item_id
+        if final_id and final_id != item_id:
+            logging.warning(
+                f"🔎 Price verify [{item_id}] skipped: redirected to different item {final_id}"
+            )
+            return item
+        verified_price, verified_shipping = _parse_us_item_detail_price_shipping(html, item_id)
+        old_price = item.get('price')
+        old_shipping = item.get('shipping')
+        # Auction current-bid and Buy-It-Now semantics are handled by the dedicated
+        # auction parser.  Generic Product/Offer JSON-LD can represent a different
+        # auction amount, so only normal fixed-price listings are price-overridden here.
+        if verified_price and not item.get('auction', False):
+            item['price'] = verified_price
+        if verified_shipping:
+            item['shipping'] = verified_shipping
+        if verified_price or verified_shipping:
+            logging.info(
+                f"🔎 Detail verify [{item_id}]: price {old_price!r}->{item.get('price')!r}, "
+                f"shipping {old_shipping!r}->{item.get('shipping')!r}"
+            )
+        return item
+    except Exception as e:
+        logging.info(f"🔎 Price verify [{item_id}] skipped after error: {e}")
+        return item
+    finally:
+        html = None
+
 
 def extract_best_offer(card):
     text = card.get_text()
@@ -9814,7 +10450,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             if title.strip().lower() in {'shop on ebay', 'opens in a new window or tab'}:
                 continue
 
-            price = extract_price_jsonld(card, url, soup) or extract_price_css(card)
+            price = extract_price_css(card) or extract_price_jsonld(card, url, soup)
             range_prices = []
             if price and ' до ' in price:
                 parts = price.split(' до ')
@@ -9929,11 +10565,12 @@ def check_and_send_new_items():
     new = []
     for item_id, data in current.items():
         if item_id in claimed:
-            new.append({'id': item_id, **data})
+            verified = _verify_new_item_price_shipping({'id': item_id, **data})
+            new.append(verified)
             logging.info(
-                f"НОВЫЙ [{item_id}]: {data['title'][:50]}... цена: {data['price']}, "
-                f"доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, "
-                f"auction: {data.get('auction')}, has_buy_it_now: {data.get('has_buy_it_now')}"
+                f"НОВЫЙ [{item_id}]: {verified['title'][:50]}... цена: {verified['price']}, "
+                f"доставка: {verified.get('shipping')}, best_offer: {verified.get('best_offer')}, "
+                f"auction: {verified.get('auction')}, has_buy_it_now: {verified.get('has_buy_it_now')}"
             )
 
     if new:
@@ -10128,11 +10765,12 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.27 AdaptiveFastAuction работает." +
+        "\n🇺🇸 eBay США monitor v6.31 PriceGuard RestartSticky работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
-        "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
-        reply_markup=auction_list_only_keyboard(),
+        "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
+        "\nКнопка «📋 Аукционы» открывает тот же список, что и /auctions.",
+        reply_markup=bot_main_reply_keyboard(),
     )
     while True:
         if is_paused:
@@ -10155,7 +10793,17 @@ def bot_worker():
                 # Реальная проблема загрузки/proxy: после активного discovery оставляем
                 # короткий jitter, чтобы быстро вернуться к поиску, но не крутить busy-loop.
                 wait = random.uniform(FAILED_SEARCH_RETRY_MIN, FAILED_SEARCH_RETRY_MAX)
-                logging.info(f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд.")
+                outage_elapsed, _, had_success = _connection_outage_snapshot()
+                if had_success:
+                    logging.info(
+                        f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд; "
+                        f"суммарно без валидного eBay HTTP 200 уже {outage_elapsed:.1f} сек. "
+                        f"({outage_elapsed / 60.0:.1f} мин.)"
+                    )
+                else:
+                    logging.info(
+                        f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд."
+                    )
             time.sleep(wait)
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
             # eBay/proxy may be perfectly healthy. A transient DB outage must not mark or
@@ -10181,11 +10829,14 @@ def start_leader_workers():
     except Exception as e:
         logging.warning(f"⚠️ Не удалось ускорить auction queue при старте: {e}; durable rows сохранены")
         auction_link_wakeup_event.set()
+    # Load credential-free restart hint before main worker starts. Provider credentials,
+    # when needed, are resolved later from the freshly fetched API snapshot.
+    _load_restart_sticky_candidate()
     db_ready_event.set()
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.27: "
+        "🌐 Multi-provider v6.30: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -10203,6 +10854,7 @@ def start_leader_workers():
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
+    threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
     threading.Thread(target=proxy_preflight_warm_worker, daemon=True, name='proxy-preflight-worker').start()
     threading.Thread(target=webshare_handoff_worker, daemon=True, name='webshare-handoff-worker').start()
     threading.Thread(target=auction_link_worker, daemon=True, name='auction-link-worker').start()
@@ -10246,7 +10898,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.28 AuctionReminderFix, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.31 PriceGuard RestartSticky, {role})"
 
 
 @app.route('/health')
