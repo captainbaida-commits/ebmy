@@ -355,15 +355,33 @@ PROXYSCRAPE_PREMIUM_REFRESH = max(30, int(os.getenv("PROXYSCRAPE_PREMIUM_REFRESH
 WEBSHARE_REFRESH = max(60, int(os.getenv("WEBSHARE_REFRESH", "300")))
 WEBSHARE_STATS_REFRESH = max(300, int(os.getenv("WEBSHARE_STATS_REFRESH", "600")))
 
-# V6.22: one metered Webshare slot is allowed immediately. The real provider billing
-# screenshot showed ~21 MB / 112 requests, so discovery probes are cheap; the expensive
-# scenario is leaving Webshare as fixed for hours. We solve that with make-before-break handoff.
-WEBSHARE_FIRST_BATCH = (os.getenv("WEBSHARE_FIRST_BATCH", "true").strip().lower() not in ("0", "false", "no"))
-WEBSHARE_UNLOCK_AFTER = max(0.0, float(os.getenv("WEBSHARE_UNLOCK_AFTER", "4")))
-WEBSHARE_UNLOCK_ATTEMPTS = max(0, int(os.getenv("WEBSHARE_UNLOCK_ATTEMPTS", "6")))
+# V6.32 FREE-FIRST provider policy.
+# Webshare is deliberately a LAST-RESORT metered rescue source:
+#   1) FREE pool first,
+#   2) ProxyScrape Premium after a short free-only wave,
+#   3) Webshare only after a real 30-second outage.
+# The old WEBSHARE_FIRST_BATCH env is retained only for backwards compatibility/logging;
+# it no longer grants Webshare an immediate discovery slot.
+WEBSHARE_FIRST_BATCH = False
+PREMIUM_UNLOCK_AFTER = max(2.0, float(os.getenv("PREMIUM_UNLOCK_AFTER", "6")))
+PREMIUM_UNLOCK_ATTEMPTS = max(4, int(os.getenv("PREMIUM_UNLOCK_ATTEMPTS", "6")))
+WEBSHARE_RESERVE_DELAY = max(20.0, float(os.getenv("WEBSHARE_RESERVE_DELAY", "30")))
+# Metered rescue is intentionally narrow even after the 30-second gate: only one Webshare
+# request may be in-flight at once and a single 75-second discovery cycle can spend at most
+# a few distinct exit hosts. This prevents a bad eBay period from burning a whole account.
+WEBSHARE_RESCUE_MAX_PER_DISCOVERY = max(
+    1, min(int(os.getenv("WEBSHARE_RESCUE_MAX_PER_DISCOVERY", "4")), 8)
+)
+WEBSHARE_RESCUE_MIN_INTERVAL = max(
+    1.0, float(os.getenv("WEBSHARE_RESCUE_MIN_INTERVAL", "3"))
+)
+# Backwards-compatible names kept for existing Render environments. Main discovery uses
+# WEBSHARE_RESERVE_DELAY only; attempt-count can no longer unlock metered Webshare early.
+WEBSHARE_UNLOCK_AFTER = WEBSHARE_RESERVE_DELAY
+WEBSHARE_UNLOCK_ATTEMPTS = max(0, int(os.getenv("WEBSHARE_UNLOCK_ATTEMPTS", "999999")))
 WEBSHARE_USAGE_SOFT_LIMIT = min(0.95, max(0.50, float(os.getenv("WEBSHARE_USAGE_SOFT_LIMIT", "0.85"))))
 WEBSHARE_USAGE_HARD_LIMIT = min(0.995, max(WEBSHARE_USAGE_SOFT_LIMIT + 0.02, float(os.getenv("WEBSHARE_USAGE_HARD_LIMIT", "0.98"))))
-WEBSHARE_HANDOFF_AFTER = max(30.0, float(os.getenv("WEBSHARE_HANDOFF_AFTER", "90")))
+WEBSHARE_HANDOFF_AFTER = max(30.0, float(os.getenv("WEBSHARE_HANDOFF_AFTER", "60")))
 WEBSHARE_HANDOFF_HIGH_USAGE_AFTER = max(15.0, float(os.getenv("WEBSHARE_HANDOFF_HIGH_USAGE_AFTER", "30")))
 WEBSHARE_HANDOFF_INTERVAL = max(10.0, float(os.getenv("WEBSHARE_HANDOFF_INTERVAL", "20")))
 WEBSHARE_HANDOFF_BATCH = max(2, min(int(os.getenv("WEBSHARE_HANDOFF_BATCH", "4")), 8))
@@ -993,6 +1011,21 @@ class ProviderManager:
         except Exception:
             return None
 
+    def _webshare_account_pressure_locked(self, idx):
+        """Ranking pressure for choosing among Webshare billing accounts.
+
+        Real consumed bandwidth remains the only HARD cutoff.  For preference ordering,
+        however, projected end-of-cycle usage is valuable: if one account is projected
+        to exhaust while another is nearly empty, choose the healthier account even when
+        both expose the same exit IP pool.
+        """
+        actual = self._webshare_usage_ratio_locked(idx)
+        projected = self._webshare_projected_ratio_locked(idx)
+        if actual is None and projected is None:
+            return 0.50
+        values = [x for x in (actual, projected) if x is not None]
+        return max(values) if values else 0.50
+
     def webshare_usage_ratio_for_proxy(self, proxy):
         with self.lock:
             idx = self.webshare_account_by_proxy.get(proxy)
@@ -1324,7 +1357,8 @@ class ProviderManager:
             if ratio is not None and ratio >= WEBSHARE_USAGE_HARD_LIMIT:
                 continue
             if state['proxies']:
-                accounts.append((idx, ratio if ratio is not None else 0.50, state))
+                pressure = self._webshare_account_pressure_locked(idx)
+                accounts.append((idx, pressure, state))
         accounts.sort(key=lambda row: (row[1], row[0]))
 
         # Interleave accounts instead of exhausting #1 before #2/#3/#4.
@@ -1372,7 +1406,8 @@ class ProviderManager:
                 if ratio is not None and ratio >= WEBSHARE_USAGE_HARD_LIMIT:
                     continue
                 if state.get('proxies'):
-                    accounts.append((idx, ratio if ratio is not None else 0.50, list(state['proxies'])))
+                    pressure = self._webshare_account_pressure_locked(idx)
+                    accounts.append((idx, pressure, list(state['proxies'])))
             accounts.sort(key=lambda row: (row[1], row[0]))
 
             out = []
@@ -1410,11 +1445,11 @@ class ProviderManager:
         self.webshare_pool_recent.append('success')
         return True
 
-    def candidates(self, include_webshare=False):
+    def candidates(self, include_premium=True, include_webshare=False):
         now = time.time()
         with self.lock:
             premium = []
-            if self.provider_circuit_until['proxyscrape_premium'] <= now:
+            if include_premium and self.provider_circuit_until['proxyscrape_premium'] <= now:
                 premium = list(self.proxy_sets['proxyscrape_premium'])
             webshare = self._webshare_candidates_locked() if include_webshare else []
         return premium + webshare
@@ -1454,11 +1489,12 @@ class ProviderManager:
     def webshare_balance_bonus(self, proxy):
         with self.lock:
             idx = self.webshare_account_by_proxy.get(proxy)
-            ratio = self._webshare_usage_ratio_locked(idx) if idx else None
-        if ratio is None:
+            pressure = self._webshare_account_pressure_locked(idx) if idx else None
+        if pressure is None:
             return 0.0
-        # Lower-used accounts get a small deterministic preference.
-        return max(-50.0, min(35.0, (0.80 - ratio) * 50.0))
+        # Strongly prefer the least-used / least-projected account when identical
+        # Webshare exit IPs are exposed through several billing keys.
+        return max(-90.0, min(55.0, (0.70 - pressure) * 70.0))
 
     def _snapshot_stats_locked(self):
         snapshot = {k: dict(v) for k, v in self.stats.items()}
@@ -2349,7 +2385,9 @@ class ProxyManager:
             tcp = []
             known = []
             for p in universe:
-                if provider_manager.source_fast(p) != 'free' and not provider_manager.managed_proxy_available(p):
+                # V6.32: the immediate failover reserve is intentionally FREE-only.
+                # Premium/Webshare enter later via explicit discovery phases.
+                if provider_manager.source_fast(p) != 'free':
                     continue
                 host = _proxy_host(p)
                 if not host or host in excluded_hosts:
@@ -2699,7 +2737,10 @@ class ProxyManager:
             self.last_used[chosen] = now
         return chosen
 
-    def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None, allow_webshare=False):
+    def get_candidate_batch(
+        self, batch_size, tried_hosts=None, preferred_scheme=None,
+        allow_premium=True, allow_webshare=False
+    ):
         """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
 
         Раньше небольшой bonus HTTP приводил к тому, что при большом пуле первые десятки
@@ -2726,7 +2767,10 @@ class ProxyManager:
 
         with self.lock:
             self._cleanup_bad_locked()
-            candidates = list(provider_manager.candidates(include_webshare=allow_webshare)) + list(self.proxies)
+            candidates = list(provider_manager.candidates(
+                include_premium=allow_premium,
+                include_webshare=allow_webshare,
+            )) + list(self.proxies)
 
             # Недавно успешный ИЛИ прогретый reserve можно использовать даже если endpoint
             # исчез из очередного ProxyScrape snapshot. Это устраняет главный недостаток
@@ -2743,7 +2787,12 @@ class ProxyManager:
                 p for p, until in self.preflight_ok_until.items() if until > now
             )
             for p in warm_extra:
-                if provider_manager.source_fast(p) != 'free' and not provider_manager.managed_proxy_available(p):
+                src = provider_manager.source_fast(p)
+                if src == 'proxyscrape_premium' and not allow_premium:
+                    continue
+                if src == 'webshare' and not allow_webshare:
+                    continue
+                if src != 'free' and not provider_manager.managed_proxy_available(p):
                     continue
                 if p not in candidates and self.bad_until.get(p, 0) <= now:
                     candidates.append(p)
@@ -2835,7 +2884,8 @@ class ProxyManager:
                 # 1 account -> one ordinary slot. 2-4 accounts -> up to two Webshare
                 # slots in ordinary rolling batches, still leaving room for Premium/FREE.
                 active_ws_accounts = provider_manager.usable_webshare_account_count()
-                ws_limit = min(active_ws_accounts, max(1, batch_size // 2), 2)
+                # Metered Webshare is a rescue source only: one exit per rolling batch.
+                ws_limit = min(active_ws_accounts, 1)
                 ws_accounts_added = {
                     provider_manager.webshare_account_index_fast(p)
                     for p in batch if provider_manager.source_fast(p) == 'webshare'
@@ -4708,6 +4758,7 @@ def send_telegram_message(
     preview_url=None,
     preview_small=True,
     return_message_id=False,
+    keep_main_keyboard=True,
 ):
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
@@ -4715,6 +4766,18 @@ def send_telegram_message(
         'parse_mode': parse_mode,
     }
     _apply_link_preview_payload(payload, disable_preview, preview_url, preview_small)
+
+    # V6.32: Telegram clients can collapse a previously sent ReplyKeyboard. Re-attach
+    # the persistent "📋 Аукционы" keyboard to every ordinary bot message that does not
+    # already need an inline keyboard. This mirrors the UK chat UX and self-heals after
+    # deploy/client restarts without requiring the user to send /start.
+    if reply_markup is None and keep_main_keyboard:
+        keyboard_builder = globals().get('bot_main_reply_keyboard')
+        if callable(keyboard_builder):
+            try:
+                reply_markup = keyboard_builder()
+            except Exception:
+                reply_markup = None
     if reply_markup is not None:
         payload['reply_markup'] = reply_markup
     result = _telegram_post('sendMessage', payload, timeout=10, max_attempts=3)
@@ -4871,8 +4934,33 @@ def bot_main_reply_keyboard():
         'resize_keyboard': True,
         'one_time_keyboard': False,
         'is_persistent': True,
+        'selective': False,
         'input_field_placeholder': 'Отправьте ссылку eBay или откройте аукционы',
     }
+
+
+def configure_telegram_bot_ui():
+    """Register command menu; ReplyKeyboard itself is refreshed by sendMessage payloads."""
+    commands = [
+        {'command': 'auctions', 'description': 'Показать текущие аукционы'},
+        {'command': 'list', 'description': 'Показать текущие аукционы'},
+        {'command': 'start', 'description': 'Продолжить мониторинг'},
+        {'command': 'stop', 'description': 'Поставить мониторинг на паузу'},
+    ]
+    result = _telegram_post(
+        'setMyCommands',
+        {
+            'commands': commands,
+            'scope': {'type': 'chat', 'chat_id': TELEGRAM_CHAT_ID},
+        },
+        timeout=8,
+        max_attempts=2,
+    )
+    if result and result.get('ok', True):
+        logging.info("⌨️ Telegram UI: команды зарегистрированы; кнопка «📋 Аукционы» активна")
+        return True
+    logging.warning("⌨️ Telegram UI: setMyCommands не подтверждён; ReplyKeyboard всё равно будет отправляться")
+    return False
 
 
 def auction_queue_keyboard(url):
@@ -8868,45 +8956,77 @@ def _store_webshare_handoff_ready(proxy, profile, session):
 
 
 def _adopt_webshare_handoff_if_ready():
-    """Make-before-break swap; never drops working Webshare before FREE is proven."""
+    """Final make-before-break validation of a FREE handoff candidate.
+
+    V6.31 could swap away from a healthy Webshare after 3 background HTTP 200s and then
+    receive an immediate 403 on the very next main request. V6.32 keeps Webshare intact,
+    performs one FINAL main-search request through the candidate, and adopts FREE only
+    if that exact request succeeds. The successful HTML is returned to the caller so no
+    duplicate main request is needed.
+    """
     global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic, webshare_handoff_ready
     with webshare_handoff_state_lock:
         ready = webshare_handoff_ready
         if ready is None:
-            return False
+            return None
         webshare_handoff_ready = None
+
     proxy, profile, session, created = ready
     if (time.monotonic() - created) > WEBSHARE_HANDOFF_READY_TTL:
         close_session(session)
-        return False
+        return None
 
-    adopted = False
     old_session = None
+    html = None
+    adopted = False
+
+    # Never break the proven Webshare session before the FREE candidate proves the exact
+    # current search request one more time.
     with main_fixed_request_lock:
-        if (
+        if not (
             fixed_proxy is not None
             and provider_manager.source_fast(fixed_proxy) == 'webshare'
             and provider_manager.source_fast(proxy) == 'free'
         ):
+            close_session(session)
+            return None
+
+        result, candidate_html, validated_session = _make_request(
+            proxy,
+            profile,
+            session=session,
+            timeout=(PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+            request_kind='discovery',
+        )
+        if result == 'success':
             old_session = fixed_session
             fixed_proxy = proxy
             fixed_profile = profile
-            fixed_session = session
+            fixed_session = validated_session
             fixed_pair_since_monotonic = time.monotonic()
             proxy_manager.mark_success(proxy)
             proxy_manager.clear_outage_memory()
+            html = candidate_html
             adopted = True
+        else:
+            proxy_manager.mark_failure(proxy, result, reason=f'{result} during final Webshare handoff validation')
+
     if adopted:
         close_session(old_session)
         logging.info(
-            f"♻️ Webshare bridge handoff complete: now using proven FREE {_proxy_log_name(proxy)}; "
-            "metered Webshare traffic stopped without an outage"
+            f"♻️ Webshare bridge handoff complete after FINAL HTTP 200: "
+            f"now using FREE {_proxy_log_name(proxy)}; metered Webshare stopped safely"
         )
         wake_queued_auctions_for_new_fixed()
         _queue_restart_sticky_persist(proxy, force=True)
-        return True
+        return html
+
     close_session(session)
-    return False
+    logging.info(
+        f"↩️ Webshare bridge candidate {_proxy_log_name(proxy)} failed final validation; "
+        "current Webshare fixed session kept unchanged"
+    )
+    return None
 
 
 def webshare_handoff_worker():
@@ -9065,7 +9185,10 @@ def webshare_handoff_worker():
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
 
-    _adopt_webshare_handoff_if_ready()
+    handoff_html = _adopt_webshare_handoff_if_ready()
+    if handoff_html:
+        record_ebay_success()
+        return handoff_html
 
     # Свежий background-резерв используется ПЕРВЫМ после падения fixed proxy.
     # На холодном старте список пуст: обычный discovery работает как раньше.
@@ -9266,6 +9389,8 @@ def fetch_ebay_html_with_fixed_pair():
     reprobed_proxies = set()
     transient_reprobed_proxies = set()
     attempts = 0
+    webshare_rescue_attempts = 0
+    webshare_last_submit_monotonic = 0.0
     refreshed_after_exhaustion = False
     emergency_loaded = False
     deep_emergency_loaded = False
@@ -9389,7 +9514,8 @@ def fetch_ebay_html_with_fixed_pair():
 
     def submit_more():
         """Поддерживает rolling in-flight probe и один безопасный последний re-probe."""
-        nonlocal attempts, refreshed_after_exhaustion, final_reprobe_used
+        nonlocal attempts, webshare_rescue_attempts, webshare_last_submit_monotonic
+        nonlocal refreshed_after_exhaustion, final_reprobe_used
 
         elapsed_now = time.monotonic() - started
         if elapsed_now >= SEARCH_TIME_BUDGET:
@@ -9425,26 +9551,33 @@ def fetch_ebay_html_with_fixed_pair():
         batch_kinds = {}
 
         if need > 0:
-            # 0) V6.22 continuity-first: reserve exactly ONE immediate Webshare slot
-            # before draining warm FREE. The latest log contained two full 75-second
-            # no-winner cycles while managed addresses were unavailable; Webshare had
-            # the best distinct-IP success rate, and a single rescue probe costs little
-            # compared with running it as fixed for hours.
-            if WEBSHARE_FIRST_BATCH and attempts == 0 and len(batch) < need:
-                active_ws_accounts = provider_manager.usable_webshare_account_count()
-                unique_ws_hosts = provider_manager.webshare_unique_host_count()
-                # Multiple keys often expose the SAME 10 exit IPs. Treat extra accounts
-                # as bandwidth capacity, not artificial IP diversity. With two funded
-                # accounts we can afford two different Webshare exits early, but never
-                # consume 3/4 first-wave workers just because more credentials exist.
-                ws_first_limit = min(
-                    active_ws_accounts,
-                    unique_ws_hosts,
-                    2,
-                    max(1, need - 1) if need > 1 else 1,
-                )
+            elapsed_provider = time.monotonic() - started
+            premium_unlocked = (
+                elapsed_provider >= PREMIUM_UNLOCK_AFTER
+                or attempts >= PREMIUM_UNLOCK_ATTEMPTS
+            )
+            webshare_unlocked = elapsed_provider >= WEBSHARE_RESERVE_DELAY
+
+            # 0) V6.32 strict metered-rescue policy:
+            # FREE is tried first, Premium joins after the initial FREE wave, and only
+            # after 30 real seconds without a winner do we spend ONE Webshare rescue slot.
+            webshare_inflight = any(
+                provider_manager.source_fast(p) == 'webshare'
+                for p in future_to_proxy.values()
+            )
+            rescue_interval_ready = (
+                not webshare_last_submit_monotonic
+                or (time.monotonic() - webshare_last_submit_monotonic) >= WEBSHARE_RESCUE_MIN_INTERVAL
+            )
+            if (
+                webshare_unlocked
+                and not webshare_inflight
+                and rescue_interval_ready
+                and webshare_rescue_attempts < WEBSHARE_RESCUE_MAX_PER_DISCOVERY
+                and len(batch) < need
+            ):
                 ws_rescues = proxy_manager.get_webshare_rescue_candidates(
-                    ws_first_limit,
+                    1,
                     excluded_hosts=(
                         tried_hosts
                         | inflight_hosts
@@ -9452,16 +9585,20 @@ def fetch_ebay_html_with_fixed_pair():
                     ),
                 )
                 for ws_rescue in ws_rescues:
-                    if len(batch) >= need:
-                        break
                     batch.append(ws_rescue)
-                    batch_kinds[ws_rescue] = 'Webshare bridge'
+                    batch_kinds[ws_rescue] = 'Webshare reserve'
+                    break
 
-            # V6.28: while the shared Webshare 403-circuit is active, allow exactly one
-            # controlled half-open probe roughly once per minute. This is intentionally
-            # independent from normal Webshare availability: the whole point is to detect
-            # recovery before the full 5-minute circuit expires.
-            if len(batch) < need:
+            # V6.28 half-open protection remains, but V6.32 also respects the 30-second
+            # Webshare reserve delay so a metered endpoint never jumps ahead of FREE/Premium.
+            if (
+                webshare_unlocked
+                and not webshare_inflight
+                and rescue_interval_ready
+                and webshare_rescue_attempts < WEBSHARE_RESCUE_MAX_PER_DISCOVERY
+                and not any(provider_manager.source_fast(p) == 'webshare' for p in batch)
+                and len(batch) < need
+            ):
                 ws_half_open = proxy_manager.get_webshare_half_open_candidate(
                     excluded_hosts=(
                         tried_hosts
@@ -9476,7 +9613,7 @@ def fetch_ebay_html_with_fixed_pair():
                         f"🟡 Webshare half-open recovery probe: {_proxy_log_name(ws_half_open)}"
                     )
 
-            # Fill the remaining first-wave workers from already proven warm reserve.
+            # Fill the remaining first-wave workers from already proven FREE reserve.
             while fast_standby_queue and len(batch) < need:
                 standby = fast_standby_queue.pop(0)
                 standby_host = _proxy_host(standby)
@@ -9505,9 +9642,16 @@ def fetch_ebay_html_with_fixed_pair():
             )
             if reprobe is not None and len(batch) < need:
                 reprobed_proxies.add(reprobe)
-                batch.append(reprobe)
-                batch_kinds[reprobe] = 'Re-probe'
-                logging.info(f"♻️ Re-probe недавно успешного proxy после cooldown: {_proxy_log_name(reprobe)}")
+                src = provider_manager.source_fast(reprobe)
+                allowed = (
+                    src == 'free'
+                    or (src == 'proxyscrape_premium' and premium_unlocked)
+                    or (src == 'webshare' and webshare_unlocked)
+                )
+                if allowed:
+                    batch.append(reprobe)
+                    batch_kinds[reprobe] = 'Re-probe'
+                    logging.info(f"♻️ Re-probe недавно успешного proxy после cooldown: {_proxy_log_name(reprobe)}")
 
             # В emergency-mode допускаем максимум 2 вторых шанса только transport-timeout/error.
             while (
@@ -9523,29 +9667,28 @@ def fetch_ebay_html_with_fixed_pair():
                 if transient is None:
                     break
                 transient_reprobed_proxies.add(transient)
+                src = provider_manager.source_fast(transient)
+                allowed = (
+                    src == 'free'
+                    or (src == 'proxyscrape_premium' and premium_unlocked)
+                    or (src == 'webshare' and webshare_unlocked)
+                )
+                if not allowed:
+                    continue
                 batch.append(transient)
                 batch_kinds[transient] = 'Transient re-probe'
                 logging.info(f"♻️ Emergency transient re-probe после cooldown: {_proxy_log_name(transient)}")
 
             remaining_need = need - len(batch)
             if remaining_need > 0:
-                elapsed_for_provider = time.monotonic() - started
-                first_wave_has_webshare = any(
-                    kind == 'Webshare bridge' for kind in batch_kinds.values()
-                )
-                allow_webshare = (
-                    (not first_wave_has_webshare)
-                    and (
-                        (WEBSHARE_FIRST_BATCH and provider_manager.has_usable_webshare())
-                        or elapsed_for_provider >= WEBSHARE_UNLOCK_AFTER
-                        or attempts >= WEBSHARE_UNLOCK_ATTEMPTS
-                    )
-                )
+                # Webshare is supplied only by the explicit one-slot rescue above.
+                # Generic candidate filling is FREE + (after unlock) Premium.
                 normal_batch = proxy_manager.get_candidate_batch(
                     remaining_need,
                     tried_hosts=tried_hosts | {_proxy_host(p) for p in batch},
                     preferred_scheme=preferred_scheme,
-                    allow_webshare=allow_webshare,
+                    allow_premium=premium_unlocked,
+                    allow_webshare=False,
                 )
                 for p in normal_batch:
                     batch.append(p)
@@ -9556,11 +9699,17 @@ def fetch_ebay_html_with_fixed_pair():
         if not batch and not future_to_proxy and attempts < MAX_SEARCH_ATTEMPTS:
             if not emergency_loaded:
                 maybe_load_emergency(force=True)
+                elapsed_provider = time.monotonic() - started
+                premium_unlocked = (
+                    elapsed_provider >= PREMIUM_UNLOCK_AFTER
+                    or attempts >= PREMIUM_UNLOCK_ATTEMPTS
+                )
                 batch = proxy_manager.get_candidate_batch(
                     min(free_slots, MAX_SEARCH_ATTEMPTS - attempts),
                     tried_hosts=tried_hosts,
                     preferred_scheme=preferred_scheme,
-                    allow_webshare=True,
+                    allow_premium=premium_unlocked,
+                    allow_webshare=False,
                 )
                 for p in batch:
                     batch_kinds[p] = 'Emergency probe'
@@ -9568,14 +9717,45 @@ def fetch_ebay_html_with_fixed_pair():
                 logging.info("♻️ Emergency-кандидаты исчерпаны; один раз обновляем расширенный список")
                 proxy_manager.refresh_proxies(force=True, emergency=True)
                 refreshed_after_exhaustion = True
+                elapsed_provider = time.monotonic() - started
+                premium_unlocked = (
+                    elapsed_provider >= PREMIUM_UNLOCK_AFTER
+                    or attempts >= PREMIUM_UNLOCK_ATTEMPTS
+                )
                 batch = proxy_manager.get_candidate_batch(
                     min(free_slots, MAX_SEARCH_ATTEMPTS - attempts),
                     tried_hosts=tried_hosts,
                     preferred_scheme=preferred_scheme,
-                    allow_webshare=True,
+                    allow_premium=premium_unlocked,
+                    allow_webshare=False,
                 )
                 for p in batch:
                     batch_kinds[p] = 'Emergency probe'
+
+        # If FREE/Premium burned through the normal attempt budget unusually fast,
+        # do NOT lose the user's 30-second Webshare safety net.  Permit the same narrowly
+        # paced Webshare reserve above the normal attempt cap; it is still bounded by
+        # WEBSHARE_RESCUE_MAX_PER_DISCOVERY and unique-host memory.
+        if (
+            not batch
+            and not future_to_proxy
+            and attempts >= MAX_SEARCH_ATTEMPTS
+            and (time.monotonic() - started) >= WEBSHARE_RESERVE_DELAY
+            and webshare_rescue_attempts < WEBSHARE_RESCUE_MAX_PER_DISCOVERY
+            and (
+                not webshare_last_submit_monotonic
+                or (time.monotonic() - webshare_last_submit_monotonic) >= WEBSHARE_RESCUE_MIN_INTERVAL
+            )
+        ):
+            ws_final = proxy_manager.get_webshare_rescue_candidate(
+                excluded_hosts=tried_hosts | inflight_hosts,
+            )
+            if ws_final is not None:
+                batch = [ws_final]
+                batch_kinds[ws_final] = 'Webshare reserve extra'
+                logging.info(
+                    f"🛟 Webshare reserve поверх обычного attempt-limit: {_proxy_log_name(ws_final)}"
+                )
 
         # После обычного лимита probe гарантируем максимум один последний шанс known-good,
         # если его cooldown уже закончился. Он не вытесняет обычного кандидата и даёт
@@ -9601,18 +9781,27 @@ def fetch_ebay_html_with_fixed_pair():
             return False
 
         for proxy in batch:
-            is_final_extra = batch_kinds.get(proxy) == 'Final known-good re-probe'
-            if not is_final_extra and attempts >= MAX_SEARCH_ATTEMPTS:
+            kind = batch_kinds.get(proxy, 'Probe')
+            is_final_extra = kind == 'Final known-good re-probe'
+            is_webshare_extra = kind == 'Webshare reserve extra'
+            if not (is_final_extra or is_webshare_extra) and attempts >= MAX_SEARCH_ATTEMPTS:
                 break
             tried_hosts.add(_proxy_host(proxy))
             tried_proxies.add(proxy)
             proxy_manager.remember_outage_attempt(proxy)
             attempts += 1
-            kind = batch_kinds.get(proxy, 'Probe')
             source = provider_manager.source_fast(proxy)
+            if source == 'webshare':
+                webshare_rescue_attempts += 1
+                webshare_last_submit_monotonic = time.monotonic()
             if source != 'free' and kind == 'Probe':
                 kind = 'Premium probe' if source == 'proxyscrape_premium' else 'Webshare rescue'
-            limit_label = f"{MAX_SEARCH_ATTEMPTS}+1" if is_final_extra else str(MAX_SEARCH_ATTEMPTS)
+            if is_final_extra:
+                limit_label = f"{MAX_SEARCH_ATTEMPTS}+1"
+            elif is_webshare_extra:
+                limit_label = f"{MAX_SEARCH_ATTEMPTS}+WS"
+            else:
+                limit_label = str(MAX_SEARCH_ATTEMPTS)
             logging.info(
                 f"🔍 {kind} {attempts}/{limit_label}: proxy {_proxy_log_name(proxy)}, профиль {profile['name']}"
             )
@@ -9641,9 +9830,34 @@ def fetch_ebay_html_with_fixed_pair():
             submit_more()
 
             if not future_to_proxy:
-                # Нет in-flight. Даём шанс final known-good re-probe; если и его нет — выход.
+                # Нет in-flight. Даём шанс final known-good re-probe; если и его нет,
+                # V6.32 всё равно удерживает этот discovery до Webshare reserve threshold.
+                # Иначе короткий цикл мог бы завершиться на 8-15 сек., сбросить timer и
+                # никогда не дойти до 30-секундного metered rescue.
                 if submit_more():
                     continue
+                elapsed_now = time.monotonic() - started
+                if (
+                    elapsed_now < WEBSHARE_RESERVE_DELAY
+                    and provider_manager.has_usable_webshare()
+                    and webshare_rescue_attempts < WEBSHARE_RESCUE_MAX_PER_DISCOVERY
+                ):
+                    wait_for = min(1.0, WEBSHARE_RESERVE_DELAY - elapsed_now)
+                    if wait_for > 0:
+                        time.sleep(wait_for)
+                    continue
+                if (
+                    elapsed_now >= WEBSHARE_RESERVE_DELAY
+                    and provider_manager.has_usable_webshare()
+                    and webshare_rescue_attempts < WEBSHARE_RESCUE_MAX_PER_DISCOVERY
+                    and webshare_last_submit_monotonic
+                ):
+                    interval_left = WEBSHARE_RESCUE_MIN_INTERVAL - (
+                        time.monotonic() - webshare_last_submit_monotonic
+                    )
+                    if interval_left > 0:
+                        time.sleep(min(1.0, interval_left))
+                        continue
                 break
 
             remaining_budget = max(0.05, SEARCH_TIME_BUDGET - (time.monotonic() - started))
@@ -10044,82 +10258,108 @@ def _iter_json_nodes(value):
 def _parse_us_item_detail_price_shipping(html, expected_item_id=None):
     """Return strongly verified (price, shipping) from an eBay US item page.
 
-    This parser intentionally ignores generic monetary text.  A detail page contains
-    many unrelated amounts (financing, coupons, crossed-out prices, other variants),
-    so only Product/Offer JSON-LD or explicit primary-price/shipping UI blocks are used.
+    V6.32 follows the exact US buy-box/shipping DOM confirmed from real ebay.com pages:
+      price    -> [data-testid="x-price-primary"] / .x-price-primary__price
+      shipping -> [data-testid="ux-labels-values--shipping"]
+    Generic monetary text and "Similar items" are deliberately ignored. JSON-LD is only
+    a fallback after the visible primary DOM, because item pages can contain unrelated
+    Offer objects for recommendations/promotions.
     """
     if not html:
         return None, None
     soup = BeautifulSoup(html, 'html.parser')
     try:
-        json_prices = []
-        for script in soup.find_all('script', type='application/ld+json'):
-            raw = script.string or script.get_text('', strip=True)
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            for node in _iter_json_nodes(data):
-                offers = node.get('offers')
-                offer_rows = offers if isinstance(offers, list) else [offers] if isinstance(offers, dict) else []
-                for offer in offer_rows:
-                    if not isinstance(offer, dict):
-                        continue
-                    currency = str(offer.get('priceCurrency') or '').upper()
-                    price = offer.get('price')
-                    if currency == 'USD' and price not in (None, '', 0, '0'):
-                        try:
-                            val = float(str(price).replace(',', ''))
-                        except Exception:
-                            continue
-                        if val > 0:
-                            json_prices.append(val)
+        verified_price = None
 
-        # Use JSON-LD only when it resolves to one unambiguous USD amount.
-        uniq = sorted({round(v, 2) for v in json_prices})
-        verified_price = f"${uniq[0]:.2f}" if len(uniq) == 1 else None
+        # 1) Real visible buy-box price. Works for fixed-price, Best Offer and auction
+        # bid boxes because eBay nests x-price-primary inside x-price-section/x-bid-price.
+        price_selectors = [
+            '[data-testid="x-price-section"] [data-testid="x-price-primary"] .x-price-primary__price .ux-textspans',
+            '[data-testid="x-price-section"] [data-testid="x-price-primary"] .ux-textspans',
+            '[data-testid="x-price-primary"] .x-price-primary__price .ux-textspans',
+            '[data-testid="x-price-primary"] .ux-textspans',
+            '.x-price-primary .x-price-primary__price .ux-textspans',
+            '.x-price-primary .ux-textspans',
+        ]
+        for sel in price_selectors:
+            for elem in soup.select(sel):
+                amount = _extract_usd_amount(elem.get_text(' ', strip=True))
+                if amount:
+                    verified_price = amount
+                    break
+            if verified_price:
+                break
 
+        # 2) Explicit item-price meta is still strong and does not scan arbitrary text.
         if verified_price is None:
-            primary_selectors = [
-                'div.x-price-primary span.ux-textspans',
-                '.x-price-primary .ux-textspans',
-                '[data-testid="x-price-primary"]',
-                '[data-testid="x-price-primary"] .ux-textspans',
-                'meta[itemprop="price"]',
-            ]
-            for sel in primary_selectors:
-                for elem in soup.select(sel):
-                    if elem.name == 'meta':
-                        content = elem.get('content') or ''
-                        try:
-                            val = float(str(content).replace(',', ''))
-                        except Exception:
-                            continue
-                        if val > 0:
-                            verified_price = f"${val:.2f}"
-                            break
-                    amount = _extract_usd_amount(elem.get_text(' ', strip=True))
-                    if amount:
-                        verified_price = amount
-                        break
-                if verified_price:
+            for elem in soup.select('meta[itemprop="price"]'):
+                content = elem.get('content') or ''
+                try:
+                    val = float(str(content).replace(',', ''))
+                except Exception:
+                    continue
+                if val > 0:
+                    verified_price = f"${val:.2f}"
                     break
 
-        verified_shipping = None
-        shipping_selectors = [
-            '.ux-labels-values--shipping',
-            '[data-testid*="shipping"]',
-            '[class*="shipping"]',
-        ]
-        for sel in shipping_selectors:
-            for elem in soup.select(sel):
-                text = re.sub(r'\s+', ' ', elem.get_text(' ', strip=True)).strip()
-                low = text.lower()
-                if not text or 'shipping' not in low and 'delivery' not in low and sel == '[class*="shipping"]':
+        # 3) JSON-LD fallback only when it resolves to one unambiguous USD amount.
+        if verified_price is None:
+            json_prices = []
+            for script in soup.find_all('script', type='application/ld+json'):
+                raw = script.string or script.get_text('', strip=True)
+                if not raw:
                     continue
-                if re.search(r'\bfree\b', low):
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+                for node in _iter_json_nodes(data):
+                    node_type = node.get('@type')
+                    if isinstance(node_type, list):
+                        node_types = {str(x).lower() for x in node_type}
+                    else:
+                        node_types = {str(node_type).lower()} if node_type else set()
+                    # Ignore recommendation/list JSON unless it is a Product/Offer node.
+                    if node_types and not ({'product', 'offer', 'aggregateoffer'} & node_types):
+                        continue
+                    offers = node.get('offers')
+                    offer_rows = offers if isinstance(offers, list) else [offers] if isinstance(offers, dict) else []
+                    for offer in offer_rows:
+                        if not isinstance(offer, dict):
+                            continue
+                        currency = str(offer.get('priceCurrency') or '').upper()
+                        price = offer.get('price')
+                        if currency == 'USD' and price not in (None, '', 0, '0'):
+                            try:
+                                val = float(str(price).replace(',', ''))
+                            except Exception:
+                                continue
+                            if val > 0:
+                                json_prices.append(val)
+
+            uniq = sorted({round(v, 2) for v in json_prices})
+            if len(uniq) == 1:
+                verified_price = f"${uniq[0]:.2f}"
+
+        verified_shipping = None
+
+        # 1) Exact shipping row shown in the supplied US HTML screenshots.
+        shipping_roots = [
+            '[data-testid="ux-layout-section__shipping"] [data-testid="ux-labels-values--shipping"]',
+            '[data-testid="ux-labels-values--shipping"]',
+            '.ux-labels-values--shipping',
+        ]
+        for sel in shipping_roots:
+            for elem in soup.select(sel):
+                values = (
+                    elem.select_one('.ux-labels-values__values-content')
+                    or elem.select_one('.ux-labels-values__values')
+                    or elem
+                )
+                text = re.sub(r'\s+', ' ', values.get_text(' ', strip=True)).strip()
+                if not text:
+                    continue
+                if re.search(r'\bfree\b', text, re.I):
                     verified_shipping = 'Бесплатно'
                     break
                 amount = _extract_usd_amount(text)
@@ -10128,6 +10368,31 @@ def _parse_us_item_detail_price_shipping(html, expected_item_id=None):
                     break
             if verified_shipping:
                 break
+
+        # Conservative compatibility fallbacks, still scoped to shipping-like blocks.
+        if verified_shipping is None:
+            shipping_selectors = [
+                '[data-testid*="shipping"]',
+                '.ux-labels-values--shipping',
+                '[class*="shipping"]',
+            ]
+            for sel in shipping_selectors:
+                for elem in soup.select(sel):
+                    text = re.sub(r'\s+', ' ', elem.get_text(' ', strip=True)).strip()
+                    low = text.lower()
+                    if not text:
+                        continue
+                    if sel == '[class*="shipping"]' and 'shipping' not in low and 'delivery' not in low:
+                        continue
+                    if re.search(r'\bfree\b', low):
+                        verified_shipping = 'Бесплатно'
+                        break
+                    amount = _extract_usd_amount(text)
+                    if amount:
+                        verified_shipping = amount
+                        break
+                if verified_shipping:
+                    break
 
         return verified_price, verified_shipping
     finally:
@@ -10765,7 +11030,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.31 PriceGuard RestartSticky работает." +
+        "\n🇺🇸 eBay США monitor v6.32 FREE-FIRST PriceGuard UI работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -10836,11 +11101,12 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.30: "
+        "🌐 Multi-provider v6.32 FREE-FIRST: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
-        f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
-        f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}, "
+        f"order=FREE→Premium@{PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS}attempts"
+        f"→Webshare@{WEBSHARE_RESERVE_DELAY:.0f}s, "
+        f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-free-first={WARM_STANDBY_TOTAL_LIMIT}, "
         f"ws403-circuit={WEBSHARE_BLOCK_CIRCUIT_STREAK}, "
         f"premium403-throttle/circuit={PREMIUM_BLOCK_THROTTLE_STREAK}/{PREMIUM_BLOCK_CIRCUIT_STREAK}"
     )
@@ -10851,6 +11117,7 @@ def start_leader_workers():
         f"🧠 MemorySafe enabled: soft/high/emergency={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB"
     )
 
+    configure_telegram_bot_ui()
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
