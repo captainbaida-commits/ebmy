@@ -38,11 +38,49 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-# Успешные проверки: нижняя граница берётся из Render.
-# При CHECK_INTERVAL=15 фактическая пауза будет 15-27 сек.
-# Ниже 15 сек. код не позволяет опускаться: это новый безопасный нижний предел,
-# а случайный jitter +12 сек. сохраняет непостоянный ритм запросов к eBay.
-CHECK_INTERVAL = max(15, int(os.getenv("CHECK_INTERVAL", "15")))
+# V6.33 FAST-CADENCE: CHECK_INTERVAL теперь означает целевой интервал МЕЖДУ
+# началами обычных циклов, а не дополнительный sleep ПОСЛЕ всей обработки.
+# Поэтому тяжёлый PriceGuard/Telegram burst больше не добавляет ещё 10-22 секунд сверху.
+# Нижняя безопасная граница снижена до 10 сек. Пользователь может оставить
+# CHECK_INTERVAL=10 в Render. V6.35 делает верхнюю границу АДАПТИВНОЙ:
+#   stable   ~10-14 сек. — основной eBay fetch стабилен;
+#   cautious ~10-18 сек. — единичные main-fetch/proxy проблемы;
+#   stressed ~10-22 сек. — повторные proxy rotations / 403 / fetch failures.
+# CHECK_JITTER остаётся абсолютным max-span для обратной совместимости.
+CHECK_INTERVAL = max(10, int(os.getenv("CHECK_INTERVAL", "10")))
+CHECK_JITTER = max(0.0, min(float(os.getenv("CHECK_JITTER", "12")), 20.0))
+ADAPTIVE_CADENCE_ENABLED = (
+    os.getenv("ADAPTIVE_CADENCE_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+ADAPTIVE_STABLE_JITTER = min(
+    CHECK_JITTER, max(2.0, float(os.getenv("ADAPTIVE_STABLE_JITTER", "4")))
+)
+ADAPTIVE_CAUTION_JITTER = min(
+    CHECK_JITTER, max(ADAPTIVE_STABLE_JITTER, float(os.getenv("ADAPTIVE_CAUTION_JITTER", "8")))
+)
+ADAPTIVE_STRESSED_JITTER = min(
+    CHECK_JITTER, max(ADAPTIVE_CAUTION_JITTER, float(os.getenv("ADAPTIVE_STRESSED_JITTER", "12")))
+)
+ADAPTIVE_HISTORY_SIZE = max(6, min(int(os.getenv("ADAPTIVE_HISTORY_SIZE", "8")), 16))
+ADAPTIVE_CAUTION_RECOVERY_CLEAN = max(3, min(int(os.getenv("ADAPTIVE_CAUTION_RECOVERY_CLEAN", "4")), 10))
+ADAPTIVE_STRESSED_TO_CAUTION_CLEAN = max(2, min(int(os.getenv("ADAPTIVE_STRESSED_TO_CAUTION_CLEAN", "3")), 8))
+# Даже если тяжёлый цикл уже занял больше целевого интервала, не делаем busy-loop:
+# короткая 2-секундная передышка сохраняет стабильность freshly-adopted proxy/session.
+MAIN_CYCLE_MIN_SLEEP = max(0.5, min(float(os.getenv("MAIN_CYCLE_MIN_SLEEP", "2.0")), 5.0))
+
+# PriceGuard должен повышать точность, а не задерживать срочное уведомление.
+# Один detail-page запрос ограничен короткими timeout, а весь burst новых товаров
+# имеет общий бюджет. После исчерпания бюджета товар отправляется сразу: чистые USD
+# search-card значения сохраняются, подозрительные/иностранные значения -> «не определено».
+PRICE_VERIFY_CONNECT_TIMEOUT = max(1.0, min(float(os.getenv("PRICE_VERIFY_CONNECT_TIMEOUT", "2.0")), 3.0))
+PRICE_VERIFY_READ_TIMEOUT = max(2.0, min(float(os.getenv("PRICE_VERIFY_READ_TIMEOUT", "4.0")), 6.0))
+PRICE_VERIFY_BURST_BUDGET = max(0.0, min(float(os.getenv("PRICE_VERIFY_BURST_BUDGET", "7.0")), 15.0))
+PRICE_VERIFY_MIN_REMAINING = max(0.8, min(float(os.getenv("PRICE_VERIFY_MIN_REMAINING", "2.0")), 4.0))
+# Если auction/status worker уже держит общую fixed Session, PriceGuard НЕ ждёт его
+# 10-20 секунд: максимум полсекунды и сразу отправляет безопасный fallback.
+PRICE_VERIFY_LOCK_WAIT = max(0.0, min(float(os.getenv("PRICE_VERIFY_LOCK_WAIT", "0.5")), 2.0))
+NEW_ITEM_TELEGRAM_GAP = max(0.5, min(float(os.getenv("NEW_ITEM_TELEGRAM_GAP", "0.8")), 1.5))
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 # ProxyScrape обновляет бесплатный список примерно раз в минуту.
@@ -212,12 +250,15 @@ AUCTION_REMINDER_LATE_GRACE = max(30, int(os.getenv("AUCTION_REMINDER_LATE_GRACE
 # тестирует extended bidding в некоторых категориях. Grace даёт время увидеть
 # продление, даже если Render/proxy временно недоступны возле самого конца.
 AUCTION_END_GRACE = max(300, int(os.getenv("AUCTION_END_GRACE", "1800")))
-# Если eBay пока показывает только грубый countdown (например 4d 14h), не угадываем
-# минуту. Сохраняем лот как pending и возвращаемся к нему, когда до даже самого
-# позднего возможного конца останется меньше ~23.5 ч. Если минутная точность всё ещё
-# скрыта, повторяем редко (по умолчанию раз в 10 минут), без Bid History/Sign-In.
+# Если eBay после всех bounded exact-attempts всё ещё показывает только грубый countdown,
+# сохраняем pending без угадывания минуты. Но первые несколько минут после добавления
+# делаем редкие ранние уточнения: eBay edge/template может быстро смениться и открыть
+# абсолютный MM/DD + clock. После раннего окна возвращаемся к лёгкой старой схеме и
+# не мучаем eBay днями — следующая проверка около последних ~23.5 ч.
 AUCTION_PENDING_REFINE_TARGET = max(20 * 3600, int(os.getenv("AUCTION_PENDING_REFINE_TARGET", str(23 * 3600 + 30 * 60))))
 AUCTION_PENDING_RETRY = max(300, int(os.getenv("AUCTION_PENDING_RETRY", "600")))
+AUCTION_PENDING_EARLY_WINDOW = max(120, int(os.getenv("AUCTION_PENDING_EARLY_WINDOW", "300")))
+AUCTION_PENDING_EARLY_RETRY = max(45, min(int(os.getenv("AUCTION_PENDING_EARLY_RETRY", "60")), 180))
 # Когда до конца <=2 часов и minute-countdown уже виден, не ждём 10 минут после
 # временной сетевой ошибки: повторяем lightweight search примерно через 2 минуты.
 AUCTION_PENDING_CLOSE_RETRY = max(60, min(int(os.getenv("AUCTION_PENDING_CLOSE_RETRY", "120")), 300))
@@ -676,30 +717,174 @@ def memory_guard_worker():
             logging.debug(f"Memory guard skipped: {e}")
         time.sleep(MEMORY_GUARD_INTERVAL)
 
+# ============ V6.35 ADAPTIVE MAIN CADENCE ============
+# ВАЖНО: сюда НЕ попадают ошибки background Smart Reserve / auction worker.
+# Иначе естественно шумный бесплатный proxy-pool постоянно держал бы monitor в slow mode.
+# Учитываются только проблемы, которые реально затронули ОСНОВНУЮ загрузку eBay.
+adaptive_cadence_lock = threading.Lock()
+adaptive_cadence_mode = 'stable'
+adaptive_cycle_issue = 0
+adaptive_cycle_reasons = []
+adaptive_recent_issues = deque(maxlen=ADAPTIVE_HISTORY_SIZE)
+adaptive_clean_streak = 0
+
+
+def adaptive_begin_main_cycle():
+    global adaptive_cycle_issue, adaptive_cycle_reasons
+    if not ADAPTIVE_CADENCE_ENABLED:
+        return
+    with adaptive_cadence_lock:
+        adaptive_cycle_issue = 0
+        adaptive_cycle_reasons = []
+
+
+def adaptive_mark_main_issue(level, reason):
+    """Mark ONLY a main-monitor problem. level: 1=minor, 2=major, 3=hard failure."""
+    global adaptive_cycle_issue, adaptive_cycle_reasons
+    if not ADAPTIVE_CADENCE_ENABLED:
+        return
+    try:
+        level = max(0, min(int(level), 3))
+    except Exception:
+        level = 1
+    with adaptive_cadence_lock:
+        adaptive_cycle_issue = max(adaptive_cycle_issue, level)
+        if reason and reason not in adaptive_cycle_reasons:
+            adaptive_cycle_reasons.append(str(reason)[:80])
+
+
+def adaptive_finish_main_cycle(result):
+    """Finish one main cycle and update stable/cautious/stressed with hysteresis.
+
+    Fast downgrade, slow recovery: a single genuine main problem enters cautious;
+    two major problems in ~4 cycles (or a full fetch failure) enter stressed.
+    Recovery requires several consecutive clean main cycles so cadence cannot flap.
+    """
+    global adaptive_cadence_mode, adaptive_clean_streak
+    if not ADAPTIVE_CADENCE_ENABLED:
+        return 'fixed', []
+
+    with adaptive_cadence_lock:
+        issue = adaptive_cycle_issue
+        reasons = list(adaptive_cycle_reasons)
+        if result == 'parse_error':
+            issue = max(issue, 1)
+            if 'parse_error' not in reasons:
+                reasons.append('parse_error')
+        elif result == 'fetch_error':
+            issue = max(issue, 3)
+            if 'fetch_error' not in reasons:
+                reasons.append('fetch_error')
+
+        adaptive_recent_issues.append(issue)
+        if issue == 0:
+            adaptive_clean_streak += 1
+        else:
+            adaptive_clean_streak = 0
+
+        recent = list(adaptive_recent_issues)
+        last4 = recent[-4:]
+        last6 = recent[-6:]
+        major_last4 = sum(1 for value in last4 if value >= 2)
+        points_last4 = sum(last4)
+        any_recent_issue = any(value > 0 for value in last6)
+
+        # Desired pressure from current/recent main-monitor history.
+        if issue >= 3 or major_last4 >= 2 or points_last4 >= 5:
+            desired = 'stressed'
+        elif issue > 0 or any_recent_issue:
+            desired = 'cautious'
+        else:
+            desired = 'stable'
+
+        old_mode = adaptive_cadence_mode
+        if old_mode == 'stable':
+            adaptive_cadence_mode = desired
+        elif old_mode == 'cautious':
+            if desired == 'stressed':
+                adaptive_cadence_mode = 'stressed'
+            elif adaptive_clean_streak >= ADAPTIVE_CAUTION_RECOVERY_CLEAN:
+                adaptive_cadence_mode = 'stable'
+        else:  # stressed
+            if adaptive_clean_streak >= ADAPTIVE_STRESSED_TO_CAUTION_CLEAN:
+                # One-step recovery is deliberate hysteresis: after 3 clean cycles leave
+                # stressed, then require a NEW 4-clean streak before stable. This prevents
+                # stressed→stable flapping after one short good patch.
+                adaptive_cadence_mode = 'cautious'
+                adaptive_clean_streak = 0
+
+        new_mode = adaptive_cadence_mode
+        clean_streak = adaptive_clean_streak
+
+    if new_mode != old_mode:
+        logging.info(
+            f"🧭 Adaptive cadence: {old_mode} → {new_mode}; "
+            f"issue={issue}, clean_streak={clean_streak}, "
+            f"recent={recent[-6:]}, reason={','.join(reasons) or 'clean'}"
+        )
+    return new_mode, reasons
+
+
+def adaptive_cadence_window():
+    if not ADAPTIVE_CADENCE_ENABLED:
+        return 'fixed', CHECK_INTERVAL, CHECK_INTERVAL + CHECK_JITTER
+    with adaptive_cadence_lock:
+        mode = adaptive_cadence_mode
+    span = {
+        'stable': ADAPTIVE_STABLE_JITTER,
+        'cautious': ADAPTIVE_CAUTION_JITTER,
+        'stressed': ADAPTIVE_STRESSED_JITTER,
+    }.get(mode, ADAPTIVE_STRESSED_JITTER)
+    return mode, float(CHECK_INTERVAL), float(CHECK_INTERVAL) + float(span)
+
+
+def adaptive_pick_target_cadence():
+    mode, low, high = adaptive_cadence_window()
+    return mode, random.uniform(low, high), low, high
+
+
 # ============ КОНТРОЛЬ ДОСТУПНОСТИ EBAY ============
 # Используем monotonic(): системные часы Render могут корректироваться, а интервал
 # "10 минут без успешного подключения" должен оставаться точным.
 connection_state_lock = threading.Lock()
 connection_watch_started_at = time.monotonic()
 last_ebay_success_at = None
+# V6.33: отдельный timestamp РЕАЛЬНОГО outage. Раньше длинная обработка 10+ новых
+# товаров могла ошибочно породить лог «связь восстановлена», хотя сеть не падала.
+connection_outage_started_at = None
 connection_alert_sent = False
 
 
+def mark_ebay_outage_start(started_at=None):
+    """Отмечает начало реального сетевого outage после неудачного main eBay request."""
+    global connection_outage_started_at
+    now = time.monotonic()
+    candidate = float(started_at) if started_at is not None else now
+    with connection_state_lock:
+        # До первого успешного eBay ответа это ещё startup/recovery, а не outage.
+        if last_ebay_success_at is None:
+            return
+        if connection_outage_started_at is None:
+            connection_outage_started_at = min(now, candidate)
+
+
 def record_ebay_success():
-    """Фиксирует успешный HTTP 200 с валидной выдачей и сбрасывает outage alert."""
-    global last_ebay_success_at, connection_alert_sent
+    """Фиксирует успешный HTTP 200 и закрывает только реальный network outage."""
+    global last_ebay_success_at, connection_outage_started_at, connection_alert_sent
     now = time.monotonic()
     with connection_state_lock:
         previous_success_at = last_ebay_success_at
         first_success = previous_success_at is None
         was_alerted = connection_alert_sent
-        recovery_gap = (now - previous_success_at) if previous_success_at is not None else None
+        outage_started = connection_outage_started_at
+        real_outage = (now - outage_started) if outage_started is not None else None
         last_ebay_success_at = now
+        connection_outage_started_at = None
         connection_alert_sent = False
-    if recovery_gap is not None and recovery_gap >= CONNECTION_RECOVERY_LOG_AFTER:
+    if real_outage is not None and real_outage >= CONNECTION_RECOVERY_LOG_AFTER:
         logging.info(
-            f"🔄 eBay связь восстановлена: между валидными HTTP 200 прошло "
-            f"{recovery_gap:.1f} сек. ({recovery_gap / 60.0:.1f} мин.)"
+            f"🔄 eBay связь восстановлена после реального сетевого сбоя: "
+            f"{real_outage:.1f} сек. ({real_outage / 60.0:.1f} мин.)"
         )
     # После deploy/долгого outage не ждём до 60 сек. status-tick: если в PostgreSQL
     # уже есть due pending-аукцион, worker сразу получит шанс его уточнить. На обычных
@@ -712,19 +897,26 @@ def record_ebay_success():
 
 def reset_connection_watch_after_manual_resume():
     """После /start даём новые 10 минут, чтобы ручная пауза не считалась аварией."""
-    global connection_watch_started_at, last_ebay_success_at, connection_alert_sent
+    global connection_watch_started_at, last_ebay_success_at, connection_outage_started_at, connection_alert_sent
     with connection_state_lock:
         connection_watch_started_at = time.monotonic()
         last_ebay_success_at = None
+        connection_outage_started_at = None
         connection_alert_sent = False
 
 
 def _connection_outage_snapshot():
     now = time.monotonic()
     with connection_state_lock:
-        reference = last_ebay_success_at if last_ebay_success_at is not None else connection_watch_started_at
-        elapsed = max(0.0, now - reference)
-        return elapsed, connection_alert_sent, (last_ebay_success_at is not None)
+        if connection_outage_started_at is not None:
+            elapsed = max(0.0, now - connection_outage_started_at)
+            return elapsed, connection_alert_sent, True
+        if last_ebay_success_at is None:
+            elapsed = max(0.0, now - connection_watch_started_at)
+            return elapsed, connection_alert_sent, False
+        # Между нормальными успешными циклами outage нет — даже если PriceGuard/Telegram
+        # обрабатывали большой burst дольше обычного интервала.
+        return 0.0, connection_alert_sent, True
 
 
 # ============ ПРОФИЛИ БРАУЗЕРОВ ============
@@ -3438,6 +3630,10 @@ def init_db():
                 "ADD COLUMN IF NOT EXISTS status_message_id BIGINT NULL"
             )
             cur.execute(
+                "ALTER TABLE auction_pending "
+                "ADD COLUMN IF NOT EXISTS refine_burst_until TIMESTAMPTZ NULL"
+            )
+            cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS auction_link_queue (
                     queue_key TEXT PRIMARY KEY,
@@ -4092,6 +4288,20 @@ def get_next_auction_link_job_state():
 
     wait_seconds = max(0.0, float(row[7] or 0.0))
     if wait_seconds > 0.25:
+        # Legacy/stale-safety: a user auction must never sit for hours because an old
+        # deployment stored an unexpectedly distant next_attempt. Current retries are
+        # capped to tens of seconds, so >30s remaining on a >2-minute-old row is stale.
+        try:
+            created_at = _ensure_aware_utc(row[5]) if row[5] else None
+            age = (datetime.now(timezone.utc) - created_at).total_seconds() if created_at else 0.0
+        except Exception:
+            age = 0.0
+        if age >= 120.0 and wait_seconds > 30.0:
+            logging.warning(
+                f"⚡ Stale auction queue rescue: key={row[0]}, age={age:.0f}s, "
+                f"stored wait={wait_seconds:.0f}s -> retry now"
+            )
+            return row[:6], 0.0
         return None, min(wait_seconds, float(AUCTION_LINK_WORKER_IDLE))
 
     return row[:6], 0.0
@@ -4182,7 +4392,12 @@ def get_auction_durable_counts():
 
 
 def recover_auction_queue_after_startup():
-    """Keep every unfinished job and make old backoff retry soon after a deploy/restart."""
+    """Recover BOTH queued and pending auctions immediately after deploy/restart.
+
+    Old versions could leave pending rows scheduled days ahead. V6.35 intentionally gives
+    every existing pending row one immediate exact-time refinement opportunity after deploy,
+    so already-hanging auctions benefit from the new parser without manual re-adding.
+    """
     with get_db_connection('ebay_us_auction_queue_recover') as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -4193,15 +4408,33 @@ def recover_auction_queue_after_startup():
                 WHERE next_attempt > NOW() + INTERVAL '3 seconds'
                 """
             )
-            accelerated = cur.rowcount
+            queue_accelerated = cur.rowcount
+            cur.execute(
+                """
+                UPDATE auction_pending
+                SET next_check = LEAST(next_check, NOW() + INTERVAL '5 seconds'),
+                    refine_burst_until = GREATEST(
+                        COALESCE(refine_burst_until, NOW()),
+                        NOW() + (%s * INTERVAL '1 second')
+                    ),
+                    updated_at = NOW()
+                WHERE next_check > NOW() + INTERVAL '5 seconds'
+                   OR refine_burst_until IS NULL
+                   OR refine_burst_until < NOW() + INTERVAL '60 seconds'
+                """,
+                (AUCTION_PENDING_EARLY_WINDOW,),
+            )
+            pending_accelerated = cur.rowcount
         conn.commit()
     exact, pending, queued = get_auction_durable_counts()
     logging.info(
         f"♻️ Durable auction state restored: exact={exact}, pending={pending}, queued={queued}; "
-        f"restart-accelerated={accelerated}"
+        f"queue-accelerated={queue_accelerated}, pending-accelerated={pending_accelerated}"
     )
     if queued:
         auction_link_wakeup_event.set()
+    if pending:
+        auction_status_wakeup_event.set()
     return exact, pending, queued
 
 
@@ -4307,9 +4540,11 @@ def set_pending_status_message(item_id, message_id):
     return changed
 
 
-def _pending_next_check(now_utc, end_latest_utc, window_seconds):
+def _pending_next_check(now_utc, end_latest_utc, window_seconds, created_at_utc=None, refine_burst_until_utc=None):
     now_utc = _ensure_aware_utc(now_utc)
     end_latest_utc = _ensure_aware_utc(end_latest_utc)
+    created_at = _ensure_aware_utc(created_at_utc) if created_at_utc else None
+    burst_until = _ensure_aware_utc(refine_burst_until_utc) if refine_burst_until_utc else None
     remaining_latest = (end_latest_utc - now_utc).total_seconds()
     # V6.17: если eBay уже показывает минуты и до конца <=2ч, это критическое окно
     # для reminder 60/30/10/5. Уточняем примерно раз в 2 минуты, но всё ещё только
@@ -4321,7 +4556,14 @@ def _pending_next_check(now_utc, end_latest_utc, window_seconds):
     # Как только даже верхняя граница меньше 24ч, проверяем без агрессивного burst.
     if remaining_latest <= 24 * 3600:
         return now_utc + timedelta(seconds=AUCTION_PENDING_RETRY)
-    # До этого не мучаем eBay: будим pending около 23ч30м до самого позднего
+    # В первые несколько минут после добавления даём eBay несколько шансов открыть
+    # более точный шаблон/MM-DD clock. Это user-driven редкий traffic, не основной monitor.
+    # Новая запись (created_at пока None) тоже получает ранний retry.
+    age = 0.0 if created_at is None else max(0.0, (now_utc - created_at).total_seconds())
+    if (burst_until and now_utc <= burst_until) or age <= AUCTION_PENDING_EARLY_WINDOW:
+        return now_utc + timedelta(seconds=AUCTION_PENDING_EARLY_RETRY)
+
+    # После раннего окна не мучаем eBay: будим pending около 23ч30м до самого позднего
     # возможного конца. Тогда реальный лот гарантированно уже находится <24ч.
     target = end_latest_utc - timedelta(seconds=AUCTION_PENDING_REFINE_TARGET)
     minimum = now_utc + timedelta(seconds=AUCTION_PENDING_MIN_DELAY)
@@ -4362,11 +4604,14 @@ def save_pending_auction(
     with get_db_connection('ebay_us_auction_pending_save') as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT end_earliest_utc, end_latest_utc FROM auction_pending "
+                "SELECT end_earliest_utc, end_latest_utc, created_at, refine_burst_until FROM auction_pending "
                 "WHERE item_id=%s FOR UPDATE",
                 (item_id,),
             )
             old = cur.fetchone()
+            old_created_at = _ensure_aware_utc(old[2]) if old and old[2] else None
+            old_burst_until = _ensure_aware_utc(old[3]) if old and old[3] else None
+            effective_burst_until = old_burst_until or (observed + timedelta(seconds=AUCTION_PENDING_EARLY_WINDOW))
             earliest, latest = new_earliest, new_latest
             if old:
                 old_earliest = _ensure_aware_utc(old[0])
@@ -4378,14 +4623,16 @@ def save_pending_auction(
                 if overlap_earliest < overlap_latest:
                     earliest, latest = overlap_earliest, overlap_latest
             window_seconds = max(1.0, (latest - earliest).total_seconds())
-            next_check = _pending_next_check(observed, latest, window_seconds)
+            next_check = _pending_next_check(
+                observed, latest, window_seconds, old_created_at, effective_burst_until
+            )
             cur.execute(
                 """
                 INSERT INTO auction_pending (
                     item_id, url, title, observed_at_utc,
                     end_earliest_utc, end_latest_utc,
-                    remaining_text, clock_text, last_check, next_check
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
+                    remaining_text, clock_text, last_check, next_check, refine_burst_until
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
                 ON CONFLICT (item_id) DO UPDATE SET
                     url=EXCLUDED.url,
                     title=EXCLUDED.title,
@@ -4396,12 +4643,13 @@ def save_pending_auction(
                     clock_text=EXCLUDED.clock_text,
                     last_check=NOW(),
                     next_check=EXCLUDED.next_check,
+                    refine_burst_until=COALESCE(auction_pending.refine_burst_until, EXCLUDED.refine_burst_until),
                     updated_at=NOW()
                 """,
                 (
                     item_id, url, title or f'eBay item {item_id}', observed,
                     earliest, latest,
-                    str(remaining_text or ''), str(clock_text or ''), next_check,
+                    str(remaining_text or ''), str(clock_text or ''), next_check, effective_burst_until,
                 ),
             )
         conn.commit()
@@ -6091,13 +6339,62 @@ def _parse_relative_day_clock(text):
     return (1 if m.group(1).lower() == 'tomorrow' else 0), hh, mm
 
 
+def _parse_monthday_clock(text, observed_at=None):
+    """Возвращает (month, day, hour, minute, explicit_year|None).
+
+    Современная eBay US search-card часто показывает абсолютный локальный clock как
+    ``(09/29, 08:25 PM)`` без weekday и timezone. Сам по себе такой clock неоднозначен,
+    но вместе с timezone-independent countdown (например ``8d 20h``) обычно оставляет
+    ровно один UTC-кандидат среди реальных civil UTC offsets.
+    """
+    if not text:
+        return None
+    raw = html_lib.unescape(str(text))
+    raw = re.sub(r'\s+', ' ', raw).strip()
+    m = re.search(
+        r'\b(0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])'
+        r'(?:[/-](20\d{2}))?\s*[,]?\s*'
+        r'(\d{1,2}):(\d{2})\s*(AM|PM)?\b',
+        raw, re.I,
+    )
+    if not m:
+        return None
+    month = int(m.group(1)); day = int(m.group(2))
+    year = int(m.group(3)) if m.group(3) else None
+    hh = int(m.group(4)); mm = int(m.group(5))
+    ampm = (m.group(6) or '').upper()
+    if mm > 59 or hh > 23:
+        return None
+    if ampm:
+        if hh > 12:
+            return None
+        hh = hh % 12 + (12 if ampm == 'PM' else 0)
+    # Validate day/month against at least one plausible year.
+    years = [year] if year else [
+        _ensure_aware_utc(observed_at or datetime.now(timezone.utc)).year - 1,
+        _ensure_aware_utc(observed_at or datetime.now(timezone.utc)).year,
+        _ensure_aware_utc(observed_at or datetime.now(timezone.utc)).year + 1,
+    ]
+    if not any(y and _valid_ymd(y, month, day) for y in years):
+        return None
+    return month, day, hh, mm, year
+
+
+def _valid_ymd(year, month, day):
+    try:
+        datetime(int(year), int(month), int(day))
+        return True
+    except Exception:
+        return False
+
+
 def _extract_localized_clock_text(text):
-    """Извлекает локализованный eBay clock: weekday либо Today/Tomorrow + HH:MM."""
+    """Извлекает локализованный eBay clock: weekday/Today/дата MM/DD + HH:MM."""
     if not text:
         return ''
     raw = html_lib.unescape(str(text))
     raw = re.sub(r'\s+', ' ', raw).strip()
-    m = re.search(
+    patterns = (
         r'(?:'
         r'\b(?:Monday|Mon|Tuesday|Tue(?:s)?|Wednesday|Wed|Thursday|Thu(?:rs?)?|Friday|Fri|Saturday|Sat|Sunday|Sun)\b'
         r'\s*[,]?\s*'
@@ -6105,9 +6402,15 @@ def _extract_localized_clock_text(text):
         r'\b(?:Today|Tomorrow)\b\s*[,]?\s*(?:at\s*)?'
         r')'
         r'\d{1,2}:\d{2}(?:\s*(?:AM|PM))?\b',
-        raw, re.I,
+        r'\b(?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])'
+        r'(?:[/-]20\d{2})?\s*[,]?\s*\d{1,2}:\d{2}(?:\s*(?:AM|PM))?\b',
     )
-    return m.group(0).strip() if m else ''
+    matches = []
+    for pat in patterns:
+        m = re.search(pat, raw, re.I)
+        if m:
+            matches.append((m.start(), m.group(0).strip()))
+    return min(matches, key=lambda x: x[0])[1] if matches else ''
 
 
 def _relative_floor_window(relative):
@@ -6141,7 +6444,8 @@ def _localized_clock_utc_candidates(relative_text, clock_text, observed_at=None)
     """
     weekday_clock = _parse_weekday_clock(clock_text)
     relative_day_clock = _parse_relative_day_clock(clock_text)
-    if not weekday_clock and not relative_day_clock:
+    monthday_clock = _parse_monthday_clock(clock_text, observed_at=observed_at)
+    if not weekday_clock and not relative_day_clock and not monthday_clock:
         return set(), None
 
     relative = _extract_relative_time_left(relative_text)
@@ -6158,6 +6462,22 @@ def _localized_clock_utc_candidates(relative_text, clock_text, observed_at=None)
 
     for offset_minutes in _CIVIL_UTC_OFFSETS_MINUTES:
         fixed_tz = timezone(timedelta(minutes=offset_minutes))
+
+        if monthday_clock:
+            month, day, hh, mm, explicit_year = monthday_clock
+            local_now = observed.astimezone(fixed_tz)
+            years = [explicit_year] if explicit_year else [
+                local_now.year - 1, local_now.year, local_now.year + 1
+            ]
+            for year in years:
+                if not year or not _valid_ymd(year, month, day):
+                    continue
+                local_end = datetime(year, month, day, hh, mm, 0, tzinfo=fixed_tz)
+                end_utc = local_end.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                remaining = (end_utc - observed).total_seconds()
+                if low - slack <= remaining < high + slack:
+                    candidates.add(end_utc)
+            continue
 
         if relative_day_clock:
             day_delta, hh, mm = relative_day_clock
@@ -6222,11 +6542,15 @@ def _extract_localized_timer_observations(raw_html, observed_at=None):
 
         clock_regex = (
             r'(?:'
+            r'(?:'
             r'\b(?:Monday|Mon|Tuesday|Tue(?:s)?|Wednesday|Wed|Thursday|Thu(?:rs?)?|Friday|Fri|Saturday|Sat|Sunday|Sun)\b\s*[,]?\s*'
             r'|'
             r'\b(?:Today|Tomorrow)\b\s*[,]?\s*(?:at\s*)?'
+            r')\d{1,2}:\d{2}(?:\s*(?:AM|PM))?'
+            r'|'
+            r'\b(?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])'
+            r'(?:[/-]20\d{2})?\s*[,]?\s*\d{1,2}:\d{2}(?:\s*(?:AM|PM))?'
             r')'
-            r'\d{1,2}:\d{2}(?:\s*(?:AM|PM))?'
         )
         relative_regex = (
             r'\b(?:Ends?\s+in|Time\s+left)\s*:?[\s]*'
@@ -7226,7 +7550,7 @@ def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True, prefer_curre
     return exact2, coarse2, had_target or had_target2, pages + reserve_pages
 
 
-def _try_resolve_quick_item_pages(pages, original_url, expected_item_id):
+def _try_resolve_quick_item_pages(pages, original_url, expected_item_id, defer_pending=False):
     """Try to finish an auction from one/few already fetched item pages.
 
     Used immediately after a route-specific search 403 on the same fixed Session, before
@@ -7274,6 +7598,8 @@ def _try_resolve_quick_item_pages(pages, original_url, expected_item_id):
                 )
 
     if coarse:
+        if defer_pending:
+            return ('coarse_observation', coarse)
         return _save_pending_from_observation(coarse, original_url, notify=True)
 
     statuses = [r[4] for r in parsed]
@@ -7303,6 +7629,7 @@ def process_auction_link(url):
 
     expected_item_id = extract_ebay_item_id_any(url or '')
     search_pages = []
+    best_coarse_observation = None
 
     # 1) First use the already proven persistent fixed Session. A search-route 403 is
     # route-specific evidence only; before any reserve rotation immediately try the
@@ -7318,7 +7645,9 @@ def process_auction_link(url):
             item_id, title, end_time_utc, source, status = exact
             return _finish_exact_auction_save(item_id, title, end_time_utc, source, notify=True)
         if coarse:
-            return _save_pending_from_observation(coarse, url, notify=True)
+            # Coarse countdown is evidence, not a reason to stop. The canonical item page
+            # often exposes a more precise timer/absolute clock even when search only says 8d 20h.
+            best_coarse_observation = coarse
 
         canonical_item_url = f"https://www.ebay.com/itm/{expected_item_id}"
         fixed_item_pages = fetch_auction_pages(
@@ -7332,9 +7661,11 @@ def process_auction_link(url):
             penalize_main_failure=True,
         )
         quick_result = _try_resolve_quick_item_pages(
-            fixed_item_pages, canonical_item_url, expected_item_id
+            fixed_item_pages, canonical_item_url, expected_item_id, defer_pending=True
         )
-        if quick_result is not None:
+        if isinstance(quick_result, tuple) and len(quick_result) == 2 and quick_result[0] == 'coarse_observation':
+            best_coarse_observation = quick_result[1] or best_coarse_observation
+        elif quick_result is not None:
             return quick_result
 
         # Only now rotate to two reserve search candidates. This avoids putting a good
@@ -7349,7 +7680,7 @@ def process_auction_link(url):
             item_id, title, end_time_utc, source, status = exact
             return _finish_exact_auction_save(item_id, title, end_time_utc, source, notify=True)
         if coarse:
-            return _save_pending_from_observation(coarse, url, notify=True)
+            best_coarse_observation = coarse
 
     # 2) Если search-card недоступна/изменилась, оставляем консервативный item-page
     # fallback. Bid History больше НЕ вызываем: логи доказали redirect на Sign In и
@@ -7410,8 +7741,13 @@ def process_auction_link(url):
                     timer_item, timer_title, timer_end, timer_source, notify=True
                 )
 
-    if coarse_page_observation:
-        return _save_pending_from_observation(coarse_page_observation, url, notify=True)
+    final_coarse = coarse_page_observation or best_coarse_observation
+    if final_coarse:
+        logging.info(
+            f"🟡 Auction exact time not found after search + canonical item-page attempts; "
+            f"saving coarse only now: item={expected_item_id}"
+        )
+        return _save_pending_from_observation(final_coarse, url, notify=True)
 
     if not pages:
         logging.warning(
@@ -7765,11 +8101,13 @@ def verify_saved_auction(item_id, url, title, expected_end, max_reserve_proxies=
 
 
 def refine_pending_auction(item_id, url, title, end_earliest, end_latest, remaining_text='', clock_text=''):
-    """Refine pending with current fixed Session first, then a tiny reserve fallback.
+    """Refine pending aggressively-but-bounded: exact search -> canonical item -> reserve search.
 
-    V6.26: search-route 403/no-target is not enough reason to rotate through Webshare/free.
-    Try canonical /itm/<id> through the same proven main Session before reserve search.
+    Coarse countdown is never an early-return condition. This fixes the historical case where
+    ``8d 20h`` caused the bot to stop before checking the item page that already exposed an
+    absolute/localized end clock.
     """
+    best_coarse = None
     # 1) Lightweight exact search through the current fixed Session only.
     exact, coarse, _had_target, _pages = _fetch_exact_item_search_pages(
         item_id, reserve_if_needed=False, prefer_current_fixed=True
@@ -7784,14 +8122,11 @@ def refine_pending_auction(item_id, url, title, end_earliest, end_latest, remain
             exact_id, exact_title or title, exact_end, source, notify=True, refined=True
         ) else 'finished'
     if coarse:
-        pending_state = _save_pending_from_observation(coarse, url, notify=False, refined=True)
-        if pending_state == 'exact':
-            return 'exact'
+        best_coarse = coarse
         logging.info(
-            f"🟡 Pending auction пока coarse через current fixed search: item={item_id}, "
-            f"remaining={coarse['remaining_text']!r}"
+            f"🟡 Pending auction coarse через current fixed search: item={item_id}, "
+            f"remaining={coarse['remaining_text']!r}; продолжаю canonical item-page для exact time"
         )
-        return 'coarse'
 
     # 2) Search route may be blocked while canonical item page works on the SAME Session.
     canonical = f"https://www.ebay.com/itm/{item_id}"
@@ -7839,14 +8174,11 @@ def refine_pending_auction(item_id, url, title, end_earliest, end_latest, remain
                 str(item_id), title, timer_end, timer_source, notify=True, refined=True
             ) else 'finished'
     if coarse_item:
-        pending_state = _save_pending_from_observation(coarse_item, url, notify=False, refined=True)
-        if pending_state == 'exact':
-            return 'exact'
+        best_coarse = coarse_item
         logging.info(
-            f"🟡 Pending auction пока coarse через current fixed item-page: item={item_id}, "
-            f"remaining={coarse_item['remaining_text']!r}"
+            f"🟡 Pending auction coarse через current fixed item-page: item={item_id}, "
+            f"remaining={coarse_item['remaining_text']!r}; продолжаю bounded reserve search"
         )
-        return 'coarse'
 
     # 3) Only now spend the small reserve search fallback (max two candidates internally).
     exact, coarse, _had_target, _pages = _fetch_exact_item_search_pages(
@@ -7862,13 +8194,16 @@ def refine_pending_auction(item_id, url, title, end_earliest, end_latest, remain
             exact_id, exact_title or title, exact_end, source, notify=True, refined=True
         ) else 'finished'
     if coarse:
-        pending_state = _save_pending_from_observation(coarse, url, notify=False, refined=True)
+        best_coarse = coarse
+        logging.info(
+            f"🟡 Pending auction всё ещё coarse после reserve search: item={item_id}, "
+            f"remaining={coarse['remaining_text']!r}"
+        )
+
+    if best_coarse:
+        pending_state = _save_pending_from_observation(best_coarse, url, notify=False, refined=True)
         if pending_state == 'exact':
             return 'exact'
-        logging.info(
-            f"🟡 Pending auction пока coarse после reserve search: item={item_id}, "
-            f"remaining={coarse['remaining_text']!r}; следующая проверка будет рассчитана заново"
-        )
         return 'coarse'
 
     # Network/HTML ambiguity never deletes pending. Close to end, keep reminders responsive.
@@ -9221,6 +9556,18 @@ def fetch_ebay_html_with_fixed_pair():
             _queue_restart_sticky_persist(old_proxy, force=False)
             return html
 
+        # V6.35: cadence-health учитывает ТОЛЬКО основную загрузку, не background proxy noise.
+        # 403/429/challenge/http_error сильнее обычного transport timeout.
+        if result in ('blocked', 'rate_limited', 'http_error'):
+            adaptive_mark_main_issue(2, f'fixed_{result}')
+        elif result != 'profile_error':
+            adaptive_mark_main_issue(1, f'fixed_{result}')
+
+        # Это уже подтверждённая неудача основного eBay request. Отмечаем реальный
+        # outage с момента начала request, чтобы длительный PriceGuard/Telegram burst
+        # никогда больше не выглядел как «потеря связи».
+        mark_ebay_outage_start(fixed_attempt_started)
+
         # Частая реальная ситуация: умерло только старое TCP/TLS соединение Session,
         # а сам proxy всё ещё жив. Быстрый reset получает ОДИН шанс с новой Session.
         # Но если первая попытка уже висела >= FIXED_RECOVERY_SKIP_AFTER, второй 12-секундный
@@ -9307,7 +9654,19 @@ def fetch_ebay_html_with_fixed_pair():
                 f"(HTTPS/TLS-ready={quality_ready}); пробуем его раньше fresh discovery"
             )
 
+        # Потеря fixed pair и переход к broad discovery — major signal для cadence,
+        # даже если новый FREE/Premium найдётся через 1-2 секунды.
+        adaptive_mark_main_issue(2, 'proxy_rotation_discovery')
         logging.info("Ищем новую рабочую пару...")
+
+    # Если мы пришли сюда без fixed пары после предыдущего неудачного цикла, outage
+    # уже мог быть отмечен. Это тоже main-monitor pressure, но fresh startup (до первого
+    # HTTP 200) намеренно не штрафуем.
+    outage_elapsed, _, had_ebay_success = _connection_outage_snapshot()
+    if had_ebay_success and outage_elapsed > 0:
+        adaptive_mark_main_issue(2, 'continued_outage_discovery')
+    # Повторный вызов идемпотентен и ничего не продлевает.
+    mark_ebay_outage_start()
 
     # 2) Rolling discovery V6.19: warm reserve -> обычные 4 worker -> 5 после 10 сек.;
     # максимум 6 при нормальном RSS; emergency/deep tiers по-прежнему расширяют сам пул.
@@ -10402,65 +10761,150 @@ def _parse_us_item_detail_price_shipping(html, expected_item_id=None):
             pass
 
 
-def _verify_new_item_price_shipping(item):
-    """One best-effort detail-page verification for a newly discovered item only.
+def _sanitize_new_item_fast_values(item):
+    """Keep only values safe enough to send without a detail-page confirmation.
 
-    It reuses the already proven fixed Session and does NOT trigger proxy discovery.
-    If verification fails, the search-card values are left unchanged.  This adds no
-    extra traffic to the normal 60-card polling loop; only genuinely new items pay one
-    additional item-page request before Telegram notification.
+    A clean USD search-card value is useful as a fast fallback. Foreign/localized
+    currencies, generic logistics text and ambiguous values are never sent as a price.
+    """
+    price = item.get('price')
+    if not price or not is_usd_price(str(price)):
+        item['price'] = None
+
+    shipping = item.get('shipping')
+    if shipping:
+        low = str(shipping).strip().lower()
+        if low in ('бесплатно', 'free', 'free shipping', 'free delivery'):
+            item['shipping'] = 'Бесплатно'
+        elif is_usd_price(str(shipping)):
+            amount = _extract_usd_amount(str(shipping))
+            item['shipping'] = amount or None
+        else:
+            item['shipping'] = None
+    else:
+        item['shipping'] = None
+    return item
+
+
+def _verify_new_item_price_shipping(item, deadline_monotonic=None):
+    """Fast bounded detail verification for one newly discovered item.
+
+    V6.33 rules:
+      * never trigger proxy discovery;
+      * use the already proven fixed Session only;
+      * obey a shared burst deadline so 10+ new items cannot block the next search;
+      * on timeout/challenge/unknown currency, keep only clean USD search-card values;
+      * suspicious values become ``None`` and Telegram says «не определена».
     """
     global fixed_session
     url = str(item.get('url') or '')
     item_id = str(item.get('id') or '')
+    original_price = item.get('price')
+    original_shipping = item.get('shipping')
+
     if not url or not item_id or fixed_session is None:
-        return item
+        item['_verify_status'] = 'no_fixed_session'
+        return _sanitize_new_item_fast_values(item)
+
+    remaining = None
+    if deadline_monotonic is not None:
+        remaining = float(deadline_monotonic) - time.monotonic()
+        if remaining < PRICE_VERIFY_MIN_REMAINING:
+            item['_verify_status'] = 'budget_exhausted'
+            logging.info(
+                f"⚡ Detail verify [{item_id}] пропущен: общий PriceGuard budget исчерпан; "
+                "отправляем сразу с безопасными search-card данными"
+            )
+            return _sanitize_new_item_fast_values(item)
+
+    connect_timeout = PRICE_VERIFY_CONNECT_TIMEOUT
+    read_timeout = PRICE_VERIFY_READ_TIMEOUT
+    if remaining is not None:
+        # Conservative bound: connect + read approximately fits the remaining burst budget.
+        connect_timeout = min(connect_timeout, max(1.0, remaining * 0.30))
+        read_timeout = min(read_timeout, max(1.5, remaining - connect_timeout))
 
     html = None
     final_url = ''
+    acquired = False
     try:
-        with main_fixed_request_lock:
-            session = fixed_session
-            if session is None:
-                return item
-            response = session.get(url, timeout=(4, 10), allow_redirects=True)
-            if response.status_code != 200:
-                logging.info(f"🔎 Price verify [{item_id}] skipped: HTTP {response.status_code}")
-                return item
-            html = response.text or ''
-            final_url = str(getattr(response, 'url', '') or '')
+        acquired = main_fixed_request_lock.acquire(timeout=PRICE_VERIFY_LOCK_WAIT)
+        if not acquired:
+            item['_verify_status'] = 'main_session_busy'
+            logging.info(
+                f"⚡ Detail verify [{item_id}] пропущен: fixed Session занята >"
+                f"{PRICE_VERIFY_LOCK_WAIT:.1f} сек.; уведомление не задерживаем"
+            )
+            return _sanitize_new_item_fast_values(item)
+
+        session = fixed_session
+        if session is None:
+            item['_verify_status'] = 'no_fixed_session'
+            return _sanitize_new_item_fast_values(item)
+        response = session.get(
+            url,
+            timeout=(connect_timeout, read_timeout),
+            allow_redirects=True,
+        )
+        if response.status_code != 200:
+            logging.info(f"🔎 Price verify [{item_id}] skipped: HTTP {response.status_code}")
+            item['_verify_status'] = f'http_{response.status_code}'
+            return _sanitize_new_item_fast_values(item)
+        html = response.text or ''
+        final_url = str(getattr(response, 'url', '') or '')
+        # После получения bytes Session больше не нужна: освобождаем lock ДО BeautifulSoup,
+        # чтобы auction/main worker не ждал CPU-parsing большого item page.
+        main_fixed_request_lock.release()
+        acquired = False
+
         low = html[:250000].lower()
         if 'pardon our interruption' in low or '/splashui/challenge' in final_url.lower():
             logging.info(f"🔎 Price verify [{item_id}] skipped: eBay challenge")
-            return item
+            item['_verify_status'] = 'challenge'
+            return _sanitize_new_item_fast_values(item)
+
         final_id = extract_item_id(final_url) if final_url else item_id
         if final_id and final_id != item_id:
             logging.warning(
                 f"🔎 Price verify [{item_id}] skipped: redirected to different item {final_id}"
             )
-            return item
+            item['_verify_status'] = 'wrong_item_redirect'
+            return _sanitize_new_item_fast_values(item)
+
         verified_price, verified_shipping = _parse_us_item_detail_price_shipping(html, item_id)
-        old_price = item.get('price')
-        old_shipping = item.get('shipping')
-        # Auction current-bid and Buy-It-Now semantics are handled by the dedicated
-        # auction parser.  Generic Product/Offer JSON-LD can represent a different
-        # auction amount, so only normal fixed-price listings are price-overridden here.
+        _sanitize_new_item_fast_values(item)
+
+        # Auction current-bid semantics stay with the auction/search parser. For normal
+        # fixed-price listings the visible detail buy-box is the strongest price source.
         if verified_price and not item.get('auction', False):
             item['price'] = verified_price
         if verified_shipping:
             item['shipping'] = verified_shipping
+
         if verified_price or verified_shipping:
+            item['_verify_status'] = 'verified'
             logging.info(
-                f"🔎 Detail verify [{item_id}]: price {old_price!r}->{item.get('price')!r}, "
-                f"shipping {old_shipping!r}->{item.get('shipping')!r}"
+                f"🔎 Detail verify [{item_id}]: price {original_price!r}->{item.get('price')!r}, "
+                f"shipping {original_shipping!r}->{item.get('shipping')!r}"
+            )
+        else:
+            item['_verify_status'] = 'no_strong_detail_value'
+            logging.info(
+                f"🔎 Detail verify [{item_id}]: сильных USD price/shipping значений не найдено; "
+                "используем только безопасный search-card fallback"
             )
         return item
     except Exception as e:
-        logging.info(f"🔎 Price verify [{item_id}] skipped after error: {e}")
-        return item
+        item['_verify_status'] = 'error'
+        logging.info(f"🔎 Price verify [{item_id}] быстро завершён после ошибки: {e}")
+        return _sanitize_new_item_fast_values(item)
     finally:
+        if acquired:
+            try:
+                main_fixed_request_lock.release()
+            except RuntimeError:
+                pass
         html = None
-
 
 def extract_best_offer(card):
     text = card.get_text()
@@ -10805,6 +11249,44 @@ def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is
     total_uah = int(total_usd * USD_TO_UAH) + EXTRA_DELIVERY_COST
     return total_uah
 
+def _build_new_item_message(item):
+    msg = f"🇺🇸 <b>НОВЫЙ ТОВАР США</b> 🇺🇸\n\n<b>{item['title']}</b>\n\n"
+    if item.get('price'):
+        msg += f"💰 Цена: {item['price']}\n"
+    else:
+        msg += "💰 Цена: не определена\n"
+
+    if item.get('shipping'):
+        msg += f"🚚 Доставка: {item['shipping']}\n"
+    else:
+        msg += "🚚 Доставка: не определена\n"
+
+    if item.get('best_offer', False):
+        msg += "✅ Сделать предложение (Best Offer)\n"
+    if item.get('auction', False):
+        if item.get('has_buy_it_now', False) and item.get('buy_it_now_price'):
+            msg += f"⏰ Аукцион / Buy It Now цена: {item['buy_it_now_price']}\n"
+        elif item.get('has_buy_it_now', False):
+            msg += "⏰ Аукцион / Buy It Now\n"
+        else:
+            msg += "⏰ Аукцион\n"
+
+    if not item.get('auction', False) or (
+        item.get('auction', False) and item.get('has_buy_it_now', False)
+    ):
+        total = calculate_total_price(
+            item.get('price'),
+            item.get('shipping'),
+            item.get('buy_it_now_price'),
+            is_auction=item.get('auction', False),
+        )
+        if total is not None:
+            msg += f"\nЗа все (с доставкой в Украину): <b>{total}грн</b>"
+
+    msg += f"\n\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
+    return msg
+
+
 def check_and_send_new_items():
     html = fetch_ebay_html_with_retry()
     if not html:
@@ -10817,72 +11299,56 @@ def check_and_send_new_items():
     if current is None:
         logging.warning("Структура основной выдачи eBay не распознана; проверка пропущена без изменений БД")
         # Это НЕ означает, что proxy плохой: HTTP 200 уже мог быть успешным.
-        # Не запускаем из-за DOM-ошибки ускоренный proxy-discovery каждые 6-10 сек.
+        # Не запускаем из-за DOM-ошибки ускоренный proxy-discovery.
         return 'parse_error'
     if not current:
         logging.info("Основная выдача eBay распознана, но подходящих карточек нет")
         return 'ok'
 
-    # ВАЖНО: вместо скачивания всех ~18k seen_items атомарно пробуем вставить только
-    # текущие item_id основной выдачи (до 60). PRIMARY KEY + ON CONFLICT гарантирует, что старый товар
-    # никогда не станет "новым" повторно, даже при коротком overlap двух Render instances.
+    # Атомарно claim только текущие item_id. После claim товар больше не будет считаться
+    # новым даже при overlap Render instances. Уведомления отправляем ПО ОДНОМУ сразу,
+    # а не ждём, пока Detail PriceGuard обработает весь burst.
     claimed = claim_new_seen_ids(list(current.keys()))
-    new = []
-    for item_id, data in current.items():
-        if item_id in claimed:
-            verified = _verify_new_item_price_shipping({'id': item_id, **data})
-            new.append(verified)
-            logging.info(
-                f"НОВЫЙ [{item_id}]: {verified['title'][:50]}... цена: {verified['price']}, "
-                f"доставка: {verified.get('shipping')}, best_offer: {verified.get('best_offer')}, "
-                f"auction: {verified.get('auction')}, has_buy_it_now: {verified.get('has_buy_it_now')}"
+    claimed_items = [
+        (item_id, data) for item_id, data in current.items() if item_id in claimed
+    ]
+
+    if not claimed_items:
+        logging.info("Новых нет")
+        return 'ok'
+
+    verify_deadline = time.monotonic() + PRICE_VERIFY_BURST_BUDGET
+    total_new = len(claimed_items)
+    logging.info(
+        f"⚡ Новых товаров: {total_new}; общий быстрый PriceGuard budget="
+        f"{PRICE_VERIFY_BURST_BUDGET:.1f} сек. После него отправка продолжается без ожидания detail-page."
+    )
+
+    for idx, (item_id, data) in enumerate(claimed_items, start=1):
+        item = {'id': item_id, **data}
+        item = _verify_new_item_price_shipping(item, deadline_monotonic=verify_deadline)
+
+        logging.info(
+            f"НОВЫЙ [{item_id}] ({idx}/{total_new}): {item['title'][:50]}... "
+            f"цена: {item.get('price') or 'не определена'}, "
+            f"доставка: {item.get('shipping') or 'не определена'}, "
+            f"verify={item.get('_verify_status')}, best_offer: {item.get('best_offer')}, "
+            f"auction: {item.get('auction')}, has_buy_it_now: {item.get('has_buy_it_now')}"
+        )
+
+        # Отправляем каждый товар сразу после его короткой проверки. Первый товар большого
+        # burst больше не ждёт проверки остальных 10-20 карточек.
+        msg = _build_new_item_message(item)
+        if not send_telegram_message(msg):
+            logging.error(
+                f"Telegram не подтвердил отправку нового item {item['id']}. "
+                "ID оставлен в seen_items специально, чтобы не создать повторную отправку."
             )
 
-    if new:
-        for item in new:
-            msg = f"🇺🇸 <b>НОВЫЙ ТОВАР США</b> 🇺🇸\n\n<b>{item['title']}</b>\n\n"
-            if item['price']:
-                msg += f"💰 Цена: {item['price']}\n"
-            else:
-                msg += "💰 Цена не указана (не USD)\n"
-            if item['shipping']:
-                msg += f"🚚 Доставка: {item['shipping']}\n"
-            else:
-                msg += "🚚 Доставка: не указана\n"
-            if item.get('best_offer', False):
-                msg += "✅ Сделать предложение (Best Offer)\n"
-            if item.get('auction', False):
-                if item.get('has_buy_it_now', False) and item.get('buy_it_now_price'):
-                    msg += f"⏰ Аукцион / Buy It Now цена: {item['buy_it_now_price']}\n"
-                elif item.get('has_buy_it_now', False):
-                    msg += "⏰ Аукцион / Buy It Now\n"
-                else:
-                    msg += "⏰ Аукцион\n"
-            if not item.get('auction', False) or (
-                item.get('auction', False) and item.get('has_buy_it_now', False)
-            ):
-                total = calculate_total_price(
-                    item['price'],
-                    item['shipping'],
-                    item.get('buy_it_now_price'),
-                    is_auction=item.get('auction', False),
-                )
-                if total is not None:
-                    msg += f"\nЗа все (с доставкой в Украину): <b>{total}грн</b>"
-            msg += f"\n\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
+        if idx < total_new:
+            time.sleep(NEW_ITEM_TELEGRAM_GAP)
 
-            # item_id уже записан в seen_items ДО Telegram. Даже если Render внезапно
-            # перезапустится после отправки, этот товар не пойдёт по второму кругу.
-            if not send_telegram_message(msg):
-                logging.error(
-                    f"Telegram не подтвердил отправку нового item {item['id']}. "
-                    "ID оставлен в seen_items специально, чтобы не создать повторную отправку."
-                )
-            time.sleep(1)
-    else:
-        logging.info("Новых нет")
     return 'ok'
-
 
 def proxy_preflight_warm_worker():
     """
@@ -11030,7 +11496,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.32 FREE-FIRST PriceGuard UI работает." +
+        "\n🇺🇸 eBay США monitor v6.35 AUCTION-EXACT-NOW PriceGuard работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -11042,27 +11508,40 @@ def bot_worker():
             time.sleep(2)
             continue
         try:
+            cycle_started = time.monotonic()
+            adaptive_begin_main_cycle()
             result = check_and_send_new_items()
+            cycle_elapsed = time.monotonic() - cycle_started
+            cadence_mode, cadence_reasons = adaptive_finish_main_cycle(result)
+
             if result == 'ok':
-                wait = random.uniform(CHECK_INTERVAL, CHECK_INTERVAL + 12)
-                logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
+                # V6.35: cadence считается от НАЧАЛА цикла и верхняя граница зависит
+                # только от здоровья MAIN monitor: stable 10-14, cautious 10-18, stressed 10-22.
+                cadence_mode, target_cadence, cadence_low, cadence_high = adaptive_pick_target_cadence()
+                wait = max(MAIN_CYCLE_MIN_SLEEP, target_cadence - cycle_elapsed)
+                logging.info(
+                    f"✅ Успешная проверка: цикл {cycle_elapsed:.1f} сек.; "
+                    f"adaptive={cadence_mode} ({cadence_low:.0f}-{cadence_high:.0f} сек.), "
+                    f"target={target_cadence:.1f}; следующая через {wait:.1f} сек."
+                )
             elif result == 'parse_error':
-                # Сеть/eBay были доступны, проблема только в DOM-разметке. Нельзя
-                # ошибочно объявлять рабочий proxy плохим и запускать частый discovery.
-                wait = random.uniform(CHECK_INTERVAL, CHECK_INTERVAL + 12)
+                # HTTP 200 был доступен, но DOM не распознан: cautious cadence без смены proxy.
+                cadence_mode, target_cadence, cadence_low, cadence_high = adaptive_pick_target_cadence()
+                wait = max(MAIN_CYCLE_MIN_SLEEP, target_cadence - cycle_elapsed)
                 logging.warning(
-                    f"⚠️ eBay доступен, но разметка не распознана. "
-                    f"Повтор обычной проверки через {wait:.0f} секунд без смены proxy."
+                    f"⚠️ eBay доступен, но разметка не распознана. Цикл {cycle_elapsed:.1f} сек.; "
+                    f"adaptive={cadence_mode} ({cadence_low:.0f}-{cadence_high:.0f} сек.), "
+                    f"повтор через {wait:.1f} сек. без смены proxy."
                 )
             else:
-                # Реальная проблема загрузки/proxy: после активного discovery оставляем
-                # короткий jitter, чтобы быстро вернуться к поиску, но не крутить busy-loop.
+                # Реальная проблема загрузки/proxy: discovery уже сам потратил время.
+                # Оставляем прежний короткий 3-5s retry, чтобы не устроить busy-loop.
                 wait = random.uniform(FAILED_SEARCH_RETRY_MIN, FAILED_SEARCH_RETRY_MAX)
                 outage_elapsed, _, had_success = _connection_outage_snapshot()
-                if had_success:
+                if had_success and outage_elapsed > 0:
                     logging.info(
                         f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд; "
-                        f"суммарно без валидного eBay HTTP 200 уже {outage_elapsed:.1f} сек. "
+                        f"реальный сетевой outage уже {outage_elapsed:.1f} сек. "
                         f"({outage_elapsed / 60.0:.1f} мин.)"
                     )
                 else:
@@ -11092,7 +11571,7 @@ def start_leader_workers():
     try:
         recover_auction_queue_after_startup()
     except Exception as e:
-        logging.warning(f"⚠️ Не удалось ускорить auction queue при старте: {e}; durable rows сохранены")
+        logging.warning(f"⚠️ Не удалось ускорить auction queue/pending при старте: {e}; durable rows сохранены")
         auction_link_wakeup_event.set()
     # Load credential-free restart hint before main worker starts. Provider credentials,
     # when needed, are resolved later from the freshly fetched API snapshot.
@@ -11101,11 +11580,15 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.32 FREE-FIRST: "
+        "🌐 Multi-provider v6.35 AUCTION-EXACT-NOW: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"order=FREE→Premium@{PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS}attempts"
         f"→Webshare@{WEBSHARE_RESERVE_DELAY:.0f}s, "
+        f"cadence=adaptive {CHECK_INTERVAL}-{CHECK_INTERVAL + ADAPTIVE_STABLE_JITTER:.0f}/"
+        f"{CHECK_INTERVAL}-{CHECK_INTERVAL + ADAPTIVE_CAUTION_JITTER:.0f}/"
+        f"{CHECK_INTERVAL}-{CHECK_INTERVAL + ADAPTIVE_STRESSED_JITTER:.0f}s from-cycle-start, "
+        f"price-budget={PRICE_VERIFY_BURST_BUDGET:.0f}s, "
         f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-free-first={WARM_STANDBY_TOTAL_LIMIT}, "
         f"ws403-circuit={WEBSHARE_BLOCK_CIRCUIT_STREAK}, "
         f"premium403-throttle/circuit={PREMIUM_BLOCK_THROTTLE_STREAK}/{PREMIUM_BLOCK_CIRCUIT_STREAK}"
@@ -11165,7 +11648,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.31 PriceGuard RestartSticky, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.35 AuctionExactNow, {role})"
 
 
 @app.route('/health')
