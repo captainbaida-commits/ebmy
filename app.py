@@ -96,6 +96,24 @@ SEARCH_CONTINUITY_MIN_OVERLAP = max(0.15, min(float(os.getenv("SEARCH_CONTINUITY
 SEARCH_CONTINUITY_COLD_MASS_NEW = max(30, min(int(os.getenv("SEARCH_CONTINUITY_COLD_MASS_NEW", "50")), 60))
 SEARCH_CONTINUITY_WARN_INTERVAL = max(10.0, float(os.getenv("SEARCH_CONTINUITY_WARN_INTERVAL", "30")))
 
+# V6.37 SEARCH-SOFT-SHELL GUARD.
+# eBay can answer HTTP 200 with a very small JS/client shell that contains the main SRP
+# container but no server-rendered result cards. Treating it as a normal DOM change costs
+# a whole cadence interval and, in production, the same IP often turns 403 on the next hit.
+# We therefore rotate ONCE immediately only when the response is both unparseable and
+# conspicuously small. A full-size unknown layout is still retried conservatively on the
+# same proxy, so a real eBay DOM rollout is not mistaken for an IP block.
+SEARCH_SOFT_SHELL_MAX_BYTES = max(
+    180_000, min(int(os.getenv("SEARCH_SOFT_SHELL_MAX_BYTES", "350000")), 800_000)
+)
+SEARCH_SOFT_SHELL_MAX_ITM_LINKS = max(
+    0, min(int(os.getenv("SEARCH_SOFT_SHELL_MAX_ITM_LINKS", "4")), 20)
+)
+SEARCH_SOFT_SHELL_IMMEDIATE_RETRY = (
+    os.getenv("SEARCH_SOFT_SHELL_IMMEDIATE_RETRY", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 # ProxyScrape обновляет бесплатный список примерно раз в минуту.
@@ -751,7 +769,7 @@ def memory_guard_worker():
             logging.debug(f"Memory guard skipped: {e}")
         time.sleep(MEMORY_GUARD_INTERVAL)
 
-# ============ V6.36 ADAPTIVE MAIN CADENCE ============
+# ============ V6.37 ADAPTIVE MAIN CADENCE ============
 # ВАЖНО: сюда НЕ попадают ошибки background Smart Reserve / auction worker.
 # Иначе естественно шумный бесплатный proxy-pool постоянно держал бы monitor в slow mode.
 # Учитываются только проблемы, которые реально затронули ОСНОВНУЮ загрузку eBay.
@@ -1731,8 +1749,14 @@ class ProviderManager:
     def _snapshot_stats_locked(self):
         snapshot = {k: dict(v) for k, v in self.stats.items()}
         for name in snapshot:
-            snapshot[name]['unique_discovery'] = len(self.discovery_proxy_seen[name])
-            snapshot[name]['unique_success'] = len(self.success_proxy_seen[name])
+            discovery_set = set(self.discovery_proxy_seen[name])
+            success_set = set(self.success_proxy_seen[name])
+            snapshot[name]['unique_discovery'] = len(discovery_set)
+            snapshot[name]['unique_success'] = len(success_set)
+            # A proxy can first succeed as Restart-sticky/fixed without ever appearing in
+            # this process's discovery set. Use the union as denominator so diagnostics
+            # can never print impossible values such as 200% endpoints.
+            snapshot[name]['unique_seen'] = len(discovery_set | success_set)
         ws_accounts = []
         for idx, state in self.webshare_accounts.items():
             ratio = self._webshare_usage_ratio_locked(idx)
@@ -1751,6 +1775,10 @@ class ProviderManager:
                 'winners': state.get('winners', 0),
                 'unique_discovery': len(state.get('unique_discovery') or ()),
                 'unique_success': len(state.get('unique_success') or ()),
+                'unique_seen': len(
+                    set(state.get('unique_discovery') or ())
+                    | set(state.get('unique_success') or ())
+                ),
             })
         return snapshot, ws_accounts
 
@@ -1762,14 +1790,15 @@ class ProviderManager:
             ds = st['discovery_success']
             unique_d = st.get('unique_discovery', 0)
             unique_s = st.get('unique_success', 0)
-            endpoint_rate = (100.0 * unique_s / unique_d) if unique_d else 0.0
+            unique_seen = st.get('unique_seen', max(unique_d, unique_s))
+            endpoint_rate = (100.0 * unique_s / unique_seen) if unique_seen else 0.0
             fixed = st['fixed_requests'] + st['recovery_requests']
             fixed_ok = st['fixed_success'] + st['recovery_success']
             winners = st['winners']
             avg_find = (st['winner_seconds_sum'] / winners) if winners else 0.0
             bits.append(
                 f"{name}: eBay={st['requests']}, discovery={d}/{ds}, "
-                f"unique={unique_d}/{unique_s} ({endpoint_rate:.1f}% endpoints), "
+                f"unique_ok={unique_s}/{unique_seen} ({endpoint_rate:.1f}% endpoints), "
                 f"fixed={fixed}/{fixed_ok}, winners={winners}, avg_find={avg_find:.1f}s, "
                 f"403={st['blocked']}, timeout={st['proxy_timeout']}, "
                 f"reject={st['proxy_rejected']}, ssl={st['proxy_ssl']}, "
@@ -1786,10 +1815,11 @@ class ProviderManager:
                     usage += f"/projected={row['projected_ratio']*100:.0f}%"
                 ud = row.get('unique_discovery', 0)
                 us = row.get('unique_success', 0)
-                q = (100.0 * us / ud) if ud else 0.0
+                ut = row.get('unique_seen', max(ud, us))
+                q = (100.0 * us / ut) if ut else 0.0
                 acct_bits.append(
                     f"ws#{row['idx']}:{row['proxy_count']}proxy/{usage}/"
-                    f"unique={ud}/{us}({q:.0f}%)/"
+                    f"unique_ok={us}/{ut}({q:.0f}%)/"
                     f"eBay={row.get('ebay_requests', 0)}/{row.get('ebay_success', 0)}/"
                     f"winners={row.get('winners', 0)}/403={row.get('blocked', 0)}"
                 )
@@ -3434,6 +3464,18 @@ class ProxyManager:
                     cooldown = [300, 600, 900, 1200][min(streak - 1, 3)]
                 else:
                     cooldown = [300, 600, 1200, 1800][min(streak - 1, 3)]
+                host_cooldown = cooldown
+            elif result == 'soft_blocked':
+                # HTTP 200 but unusably thin search shell / no server-rendered cards.
+                # This is strongly correlated with an imminent 403, but is less certain
+                # than an explicit block, so keep a shorter cooldown than hard blocked.
+                provider = provider_manager.source_fast(proxy)
+                if provider in ('proxyscrape_premium', 'webshare'):
+                    cooldown = [300, 600, 900, 1200][min(streak - 1, 3)]
+                elif known_good:
+                    cooldown = [120, 300, 600, 900][min(streak - 1, 3)]
+                else:
+                    cooldown = [180, 300, 600, 900][min(streak - 1, 3)]
                 host_cooldown = cooldown
             elif result == 'proxy_rejected':
                 # CONNECT 400/405/500/aborted — жёсткий отказ туннеля. Это не обычный
@@ -9575,6 +9617,131 @@ def webshare_handoff_worker():
             webshare_handoff_wakeup_event.clear()
 
 
+def _search_html_title(html):
+    if not html:
+        return ''
+    # Fast diagnostic only; avoid a second BeautifulSoup tree for every normal cycle.
+    m = re.search(r'<title[^>]*>(.*?)</title>', str(html), re.I | re.S)
+    if not m:
+        return ''
+    return re.sub(r'\s+', ' ', html_lib.unescape(m.group(1))).strip()
+
+
+def _looks_like_ebay_thin_search_shell(html):
+    """True only for a conspicuously small, unusable eBay search response.
+
+    This is deliberately strict. A full-size unknown DOM is NOT classified as a block:
+    it remains a normal parse_error so a genuine eBay markup rollout can recover without
+    unnecessarily burning a good proxy.
+    """
+    if not html:
+        return False
+    try:
+        raw = str(html)
+        body_len = len(raw.encode('utf-8', errors='ignore'))
+    except Exception:
+        raw = str(html)
+        body_len = len(raw)
+
+    if body_len > SEARCH_SOFT_SHELL_MAX_BYTES:
+        return False
+
+    low = raw.lower()
+    # Known hard block/challenge pages are already handled by _make_request.
+    if (
+        'pardon our interruption' in low
+        or '/splashui/challenge' in low
+        or 'captcha' in low
+    ):
+        return False
+
+    # Main search shells may still carry the SRP root, but virtually no actual item links.
+    itm_links = low.count('/itm/')
+    known_card_markers = (
+        's-card__link',
+        's-item__link',
+        'su-card-container',
+        's-card__price',
+        's-item__price',
+    )
+    has_known_cards = any(marker in low for marker in known_card_markers)
+    looks_ebay = '<title' in low and 'ebay' in low
+    looks_search = (
+        'srp-river-results' in low
+        or '/sch/' in low
+        or 'search' in low
+    )
+    return bool(
+        looks_ebay
+        and looks_search
+        and not has_known_cards
+        and itm_links <= SEARCH_SOFT_SHELL_MAX_ITM_LINKS
+    )
+
+
+def _quarantine_fixed_after_soft_search_shell(html):
+    """Drop the current fixed pair after an unusable thin HTTP-200 search shell.
+
+    Returns True when a fixed proxy was actually quarantined. The caller may then make
+    one immediate normal fetch, which will run the existing FREE->Premium->Webshare
+    discovery path. No extra retry loop is allowed beyond that one rescue attempt.
+    """
+    global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
+
+    if not _looks_like_ebay_thin_search_shell(html):
+        return False
+
+    try:
+        body_len = len(str(html).encode('utf-8', errors='ignore'))
+    except Exception:
+        body_len = len(str(html))
+    title = _search_html_title(html) or '?'
+
+    old_proxy = None
+    old_session = None
+    acquired = main_fixed_request_lock.acquire(timeout=1.0)
+    try:
+        if not acquired:
+            logging.warning(
+                f"🧩 Thin search shell detected (bytes={body_len}, title={title!r}), "
+                "но fixed-session сейчас занята; немедленную ротацию пропускаем"
+            )
+            adaptive_mark_main_issue(1, 'thin_search_shell_busy')
+            return False
+
+        old_proxy = fixed_proxy
+        old_session = fixed_session
+        fixed_proxy = None
+        fixed_profile = None
+        fixed_session = None
+        fixed_pair_since_monotonic = None
+    finally:
+        if acquired:
+            main_fixed_request_lock.release()
+
+    close_session(old_session)
+    if old_proxy:
+        proxy_manager.mark_failure(
+            old_proxy,
+            'soft_blocked',
+            reason='HTTP 200 thin/unusable eBay search shell',
+        )
+        # For auction surface this behaves like a short soft eBay host penalty.
+        _auction_proxy_soft_host_penalty(old_proxy, 'blocked', seconds=EBAY_CROSS_SOFT_PENALTY)
+        webshare_handoff_wakeup_event.set()
+        mark_ebay_outage_start(time.monotonic())
+        adaptive_mark_main_issue(2, 'thin_search_shell_rotate')
+        logging.warning(
+            f"🧩 HTTP 200 soft-shell eBay: bytes={body_len}, title={title!r}; "
+            f"fixed {_proxy_log_name(old_proxy)} снят сразу, запускаем один быстрый "
+            "reserve/discovery retry вместо ожидания полного cadence"
+        )
+        return True
+
+    adaptive_mark_main_issue(1, 'thin_search_shell_no_fixed')
+    return False
+
+
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
 
@@ -11324,18 +11491,29 @@ def _search_continuity_seed(current_ids):
 
 def perform_initial_snapshot():
     logging.info("Начальный снимок...")
-    html = fetch_ebay_html_with_retry()
-    if not html:
-        return False
-    items = parse_ebay_listings(html, max_items=MAX_ITEMS)
-    html = None
-    _memory_maintenance('initial snapshot', force=False)
-    if not items:
-        return False
-    _search_continuity_seed(items.keys())
-    add_seen_ids_batch(list(items.keys()))
-    logging.info(f"Снимок: {len(items)} товаров")
-    return True
+    for parse_attempt in range(2):
+        html = fetch_ebay_html_with_retry()
+        if not html:
+            return False
+        items = parse_ebay_listings(html, max_items=MAX_ITEMS)
+        if (
+            items is None
+            and parse_attempt == 0
+            and SEARCH_SOFT_SHELL_IMMEDIATE_RETRY
+            and _quarantine_fixed_after_soft_search_shell(html)
+        ):
+            html = None
+            _memory_maintenance('initial thin-shell retry', force=False)
+            continue
+        html = None
+        _memory_maintenance('initial snapshot', force=False)
+        if not items:
+            return False
+        _search_continuity_seed(items.keys())
+        add_seen_ids_batch(list(items.keys()))
+        logging.info(f"Снимок: {len(items)} товаров")
+        return True
+    return False
 
 def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is_auction=False):
     """Estimate total in UAH only from confirmed USD amounts.
@@ -11414,18 +11592,38 @@ def _build_new_item_message(item):
 
 
 def check_and_send_new_items():
-    html = fetch_ebay_html_with_retry()
-    if not html:
-        logging.warning("Не удалось загрузить страницу, проверка пропущена")
-        return 'fetch_error'
+    current = None
+    for parse_attempt in range(2):
+        html = fetch_ebay_html_with_retry()
+        if not html:
+            logging.warning("Не удалось загрузить страницу, проверка пропущена")
+            return 'fetch_error'
 
-    current = parse_ebay_listings(html)
-    html = None
-    _memory_maintenance('main parse', force=False)
+        current = parse_ebay_listings(html)
+
+        # V6.37: один редкий, строго ограниченный rescue для HTTP-200 thin shell.
+        # Production case: ~149 KB HTML, title='cross stitch kit | eBay', SRP root есть,
+        # карточек нет; через следующий cadence тот же proxy уже дал 403. Не тратим
+        # лишние 10-18 секунд: снимаем только этот fixed pair и сразу используем обычный
+        # reserve/discovery. Full-size unknown DOM сюда НЕ попадает.
+        if (
+            current is None
+            and parse_attempt == 0
+            and SEARCH_SOFT_SHELL_IMMEDIATE_RETRY
+            and _quarantine_fixed_after_soft_search_shell(html)
+        ):
+            html = None
+            _memory_maintenance('thin-shell rotate', force=False)
+            continue
+
+        html = None
+        _memory_maintenance('main parse', force=False)
+        break
+
     if current is None:
         logging.warning("Структура основной выдачи eBay не распознана; проверка пропущена без изменений БД")
-        # Это НЕ означает, что proxy плохой: HTTP 200 уже мог быть успешным.
-        # Не запускаем из-за DOM-ошибки ускоренный proxy-discovery.
+        # Полноразмерный неизвестный DOM может быть реальным A/B rollout eBay.
+        # Его НЕ считаем плохим proxy автоматически: cautious retry на той же паре безопаснее.
         return 'parse_error'
     if not current:
         logging.info("Основная выдача eBay распознана, но подходящих карточек нет")
@@ -11625,7 +11823,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.36 CONTINUITY-MEMORY-GUARD работает." +
+        "\n🇺🇸 eBay США monitor v6.37 SOFT-SHELL-RECOVERY работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -11717,7 +11915,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.36 CONTINUITY-MEMORY-GUARD: "
+        "🌐 Multi-provider v6.37 SOFT-SHELL-RECOVERY: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"order=FREE→Premium@{PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS}attempts"
@@ -11742,6 +11940,11 @@ def start_leader_workers():
         f"🛡 Search continuity: ON={SEARCH_CONTINUITY_GUARD_ENABLED}, "
         f"min_items={SEARCH_CONTINUITY_MIN_ITEMS}, min_overlap={SEARCH_CONTINUITY_MIN_OVERLAP:.0%}, "
         f"cold_mass={SEARCH_CONTINUITY_COLD_MASS_NEW}"
+    )
+    logging.info(
+        f"🧩 Search soft-shell guard: max_bytes={SEARCH_SOFT_SHELL_MAX_BYTES}, "
+        f"max_itm_links={SEARCH_SOFT_SHELL_MAX_ITM_LINKS}, "
+        f"immediate_retry={SEARCH_SOFT_SHELL_IMMEDIATE_RETRY}"
     )
     if CHECK_INTERVAL > 10:
         logging.info(
@@ -11797,7 +12000,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.36 ContinuityMemory, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.37 SoftShellRecovery, {role})"
 
 
 @app.route('/health')
