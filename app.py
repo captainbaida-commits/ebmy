@@ -42,7 +42,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # началами обычных циклов, а не дополнительный sleep ПОСЛЕ всей обработки.
 # Поэтому тяжёлый PriceGuard/Telegram burst больше не добавляет ещё 10-22 секунд сверху.
 # Нижняя безопасная граница снижена до 10 сек. Пользователь может оставить
-# CHECK_INTERVAL=10 в Render. V6.35 делает верхнюю границу АДАПТИВНОЙ:
+# CHECK_INTERVAL=10 в Render. V6.36 сохраняет АДАПТИВНУЮ верхнюю границу:
 #   stable   ~10-14 сек. — основной eBay fetch стабилен;
 #   cautious ~10-18 сек. — единичные main-fetch/proxy проблемы;
 #   stressed ~10-22 сек. — повторные proxy rotations / 403 / fetch failures.
@@ -81,6 +81,21 @@ PRICE_VERIFY_MIN_REMAINING = max(0.8, min(float(os.getenv("PRICE_VERIFY_MIN_REMA
 # 10-20 секунд: максимум полсекунды и сразу отправляет безопасный fallback.
 PRICE_VERIFY_LOCK_WAIT = max(0.0, min(float(os.getenv("PRICE_VERIFY_LOCK_WAIT", "0.5")), 2.0))
 NEW_ITEM_TELEGRAM_GAP = max(0.5, min(float(os.getenv("NEW_ITEM_TELEGRAM_GAP", "0.8")), 1.5))
+
+# V6.36 SEARCH-CONTINUITY GUARD. eBay/proxy occasionally returns a different result
+# universe while keeping HTTP 200 and even 60 valid-looking cards. A sudden near-total
+# replacement of the previous top-60 must NOT be committed as 60 "new" items.
+SEARCH_CONTINUITY_GUARD_ENABLED = (
+    os.getenv("SEARCH_CONTINUITY_GUARD_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+SEARCH_CONTINUITY_MIN_ITEMS = max(20, min(int(os.getenv("SEARCH_CONTINUITY_MIN_ITEMS", "40")), 60))
+SEARCH_CONTINUITY_MIN_OVERLAP = max(0.15, min(float(os.getenv("SEARCH_CONTINUITY_MIN_OVERLAP", "0.35")), 0.80))
+# Cold-process protection: if there is no in-RAM trusted page yet, a page where almost
+# everything is unseen in the durable DB is quarantined instead of flooding Telegram.
+SEARCH_CONTINUITY_COLD_MASS_NEW = max(30, min(int(os.getenv("SEARCH_CONTINUITY_COLD_MASS_NEW", "50")), 60))
+SEARCH_CONTINUITY_WARN_INTERVAL = max(10.0, float(os.getenv("SEARCH_CONTINUITY_WARN_INTERVAL", "30")))
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 # ProxyScrape обновляет бесплатный список примерно раз в минуту.
@@ -351,16 +366,25 @@ FIXED_RECOVERY_SKIP_AFTER = max(
     8.0, float(os.getenv("FIXED_RECOVERY_SKIP_AFTER", "18"))
 )
 
-# V6.26 AdaptiveFast: Render Free is capped at 512 MB. The observed V6.25 RSS stayed
-# around 198–290 MB, so 400 MB was unnecessarily conservative as a HIGH-pressure point.
-# Keep early GC/trim as cheap prevention, but do not pause background work/cap discovery until
-# ~450 MB. A second emergency ceiling near 485 MB preserves headroom below Render's 512 MB kill.
+# V6.36 MEMORY HYSTERESIS. Current US production has a stable post-trim baseline around
+# 460-470 MB. The old 450/360 high/clear pair became a one-way latch: once HIGH was set,
+# RSS could never fall to 360 MB, so auction/status workers stayed paused indefinitely.
+# Keep enough headroom below Render's 512 MB cap while making HIGH a transient spike state.
 MEMORY_GUARD_ENABLED = (os.getenv("MEMORY_GUARD_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off"))
 MEMORY_GUARD_INTERVAL = max(5.0, float(os.getenv("MEMORY_GUARD_INTERVAL", "10")))
-MEMORY_SOFT_MB = max(220, int(os.getenv("MEMORY_SOFT_MB", "330")))
-MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 40, int(os.getenv("MEMORY_HIGH_MB", "450")))
-MEMORY_EMERGENCY_MB = max(MEMORY_HIGH_MB + 20, min(int(os.getenv("MEMORY_EMERGENCY_MB", "485")), 500))
-MEMORY_CLEAR_MB = min(MEMORY_HIGH_MB - 30, max(180, int(os.getenv("MEMORY_CLEAR_MB", "360"))))
+MEMORY_SOFT_MB = max(300, int(os.getenv("MEMORY_SOFT_MB", "455")))
+MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 10, int(os.getenv("MEMORY_HIGH_MB", "475")))
+MEMORY_EMERGENCY_MB = max(MEMORY_HIGH_MB + 10, min(int(os.getenv("MEMORY_EMERGENCY_MB", "490")), 500))
+MEMORY_CLEAR_MB = min(
+    MEMORY_HIGH_MB - 4,
+    max(MEMORY_SOFT_MB - 10, int(os.getenv("MEMORY_CLEAR_MB", "465"))),
+)
+# User-submitted auction enrichment is sequential and important. It may run under ordinary
+# HIGH pressure after a forced trim, but not when RSS remains near the emergency ceiling.
+MEMORY_AUCTION_PAUSE_MB = min(
+    MEMORY_EMERGENCY_MB - 2,
+    max(MEMORY_HIGH_MB, int(os.getenv("MEMORY_AUCTION_PAUSE_MB", "482"))),
+)
 PROXY_REPUTATION_TTL = max(1800, int(os.getenv("PROXY_REPUTATION_TTL", "21600")))
 PROXY_REPUTATION_MAX = max(1000, int(os.getenv("PROXY_REPUTATION_MAX", "7000")))
 PROVIDER_UNIQUE_STATS_CAP = max(500, int(os.getenv("PROVIDER_UNIQUE_STATS_CAP", "4096")))
@@ -686,6 +710,16 @@ def _memory_maintenance(reason='', force=False):
     return rss
 
 
+def _auction_memory_blocked():
+    """Only block user auction work near the REAL emergency ceiling.
+
+    A forced trim is cheap compared with leaving a user-submitted auction pending for hours.
+    Background Smart Reserve/Webshare handoff still obey the stricter HIGH-pressure event.
+    """
+    rss = _memory_maintenance('auction gate', force=True)
+    return bool(rss is not None and rss >= MEMORY_AUCTION_PAUSE_MB)
+
+
 def memory_guard_worker():
     db_ready_event.wait()
     if not MEMORY_GUARD_ENABLED:
@@ -717,7 +751,7 @@ def memory_guard_worker():
             logging.debug(f"Memory guard skipped: {e}")
         time.sleep(MEMORY_GUARD_INTERVAL)
 
-# ============ V6.35 ADAPTIVE MAIN CADENCE ============
+# ============ V6.36 ADAPTIVE MAIN CADENCE ============
 # ВАЖНО: сюда НЕ попадают ошибки background Smart Reserve / auction worker.
 # Иначе естественно шумный бесплатный proxy-pool постоянно держал бы monitor в slow mode.
 # Учитываются только проблемы, которые реально затронули ОСНОВНУЮ загрузку eBay.
@@ -727,6 +761,11 @@ adaptive_cycle_issue = 0
 adaptive_cycle_reasons = []
 adaptive_recent_issues = deque(maxlen=ADAPTIVE_HISTORY_SIZE)
 adaptive_clean_streak = 0
+
+# Trusted result-set fingerprint used only to reject abrupt alternate eBay result universes.
+search_continuity_lock = threading.Lock()
+search_continuity_trusted_ids = set()
+search_continuity_last_warn = 0.0
 
 
 def adaptive_begin_main_cycle():
@@ -754,11 +793,12 @@ def adaptive_mark_main_issue(level, reason):
 
 
 def adaptive_finish_main_cycle(result):
-    """Finish one main cycle and update stable/cautious/stressed with hysteresis.
+    """Finish one main cycle and update stable/cautious/stressed with real hysteresis.
 
-    Fast downgrade, slow recovery: a single genuine main problem enters cautious;
-    two major problems in ~4 cycles (or a full fetch failure) enter stressed.
-    Recovery requires several consecutive clean main cycles so cadence cannot flap.
+    V6.36 fixes a subtle V6.35 flap: after 4 clean cycles cautious->stable could be
+    immediately followed by stable->cautious on another CLEAN cycle merely because an
+    older issue was still present in the history deque. Clean cycles can no longer
+    downgrade a stable monitor. Past issue history is cleared after full recovery.
     """
     global adaptive_cadence_mode, adaptive_clean_streak
     if not ADAPTIVE_CADENCE_ENABLED:
@@ -767,10 +807,11 @@ def adaptive_finish_main_cycle(result):
     with adaptive_cadence_lock:
         issue = adaptive_cycle_issue
         reasons = list(adaptive_cycle_reasons)
-        if result == 'parse_error':
+        if result in ('parse_error', 'continuity_hold'):
             issue = max(issue, 1)
-            if 'parse_error' not in reasons:
-                reasons.append('parse_error')
+            tag = 'parse_error' if result == 'parse_error' else 'search_result_discontinuity'
+            if tag not in reasons:
+                reasons.append(tag)
         elif result == 'fetch_error':
             issue = max(issue, 3)
             if 'fetch_error' not in reasons:
@@ -784,46 +825,45 @@ def adaptive_finish_main_cycle(result):
 
         recent = list(adaptive_recent_issues)
         last4 = recent[-4:]
-        last6 = recent[-6:]
         major_last4 = sum(1 for value in last4 if value >= 2)
         points_last4 = sum(last4)
-        any_recent_issue = any(value > 0 for value in last6)
 
-        # Desired pressure from current/recent main-monitor history.
         if issue >= 3 or major_last4 >= 2 or points_last4 >= 5:
             desired = 'stressed'
-        elif issue > 0 or any_recent_issue:
+        elif issue > 0:
             desired = 'cautious'
         else:
-            desired = 'stable'
+            desired = adaptive_cadence_mode  # clean never downgrades a healthy stable state
 
         old_mode = adaptive_cadence_mode
         if old_mode == 'stable':
-            adaptive_cadence_mode = desired
+            if issue > 0:
+                adaptive_cadence_mode = desired
         elif old_mode == 'cautious':
-            if desired == 'stressed':
+            if issue > 0 and desired == 'stressed':
                 adaptive_cadence_mode = 'stressed'
-            elif adaptive_clean_streak >= ADAPTIVE_CAUTION_RECOVERY_CLEAN:
+            elif issue == 0 and adaptive_clean_streak >= ADAPTIVE_CAUTION_RECOVERY_CLEAN:
                 adaptive_cadence_mode = 'stable'
+                adaptive_clean_streak = 0
+                adaptive_recent_issues.clear()
         else:  # stressed
-            if adaptive_clean_streak >= ADAPTIVE_STRESSED_TO_CAUTION_CLEAN:
-                # One-step recovery is deliberate hysteresis: after 3 clean cycles leave
-                # stressed, then require a NEW 4-clean streak before stable. This prevents
-                # stressed→stable flapping after one short good patch.
+            if issue == 0 and adaptive_clean_streak >= ADAPTIVE_STRESSED_TO_CAUTION_CLEAN:
                 adaptive_cadence_mode = 'cautious'
                 adaptive_clean_streak = 0
+            elif issue > 0:
+                adaptive_cadence_mode = 'stressed'
 
         new_mode = adaptive_cadence_mode
         clean_streak = adaptive_clean_streak
+        recent_for_log = list(adaptive_recent_issues)[-6:]
 
     if new_mode != old_mode:
         logging.info(
             f"🧭 Adaptive cadence: {old_mode} → {new_mode}; "
             f"issue={issue}, clean_streak={clean_streak}, "
-            f"recent={recent[-6:]}, reason={','.join(reasons) or 'clean'}"
+            f"recent={recent_for_log}, reason={','.join(reasons) or 'clean'}"
         )
     return new_mode, reasons
-
 
 def adaptive_cadence_window():
     if not ADAPTIVE_CADENCE_ENABLED:
@@ -3875,6 +3915,24 @@ def _increment_seen_count_cache(delta):
             return None
         seen_count_cache += int(delta)
         return seen_count_cache
+
+
+def peek_unseen_seen_ids(item_ids):
+    """Read-only preview of unseen IDs; used only by the cold-start continuity guard."""
+    unique_ids = list(dict.fromkeys(str(x) for x in item_ids if x))
+    if not unique_ids:
+        return set()
+    with get_db_connection('ebay_us_seen_peek') as conn:
+        with conn.cursor() as cur:
+            rows = execute_values(
+                cur,
+                "SELECT v.item_id FROM (VALUES %s) AS v(item_id) "
+                "LEFT JOIN seen_items s ON s.item_id = v.item_id "
+                "WHERE s.item_id IS NULL",
+                [(item_id,) for item_id in unique_ids],
+                fetch=True,
+            )
+    return {row[0] for row in rows}
 
 
 def claim_new_seen_ids(item_ids):
@@ -7851,7 +7909,7 @@ def auction_link_worker():
             # Main new-item monitor has priority over auction enrichment under failover/RAM
             # pressure. The job stays due in PostgreSQL (no attempt/backoff increment), so
             # it resumes within a couple seconds when the main path is stable.
-            if main_discovery_active_event.is_set() or memory_pressure_event.is_set():
+            if main_discovery_active_event.is_set() or _auction_memory_blocked():
                 auction_link_wakeup_event.wait(timeout=2.0)
                 continue
 
@@ -8252,7 +8310,7 @@ def auction_status_worker():
             healthy = (
                 (is_paused or (had_success and elapsed < 180))
                 and not main_discovery_active_event.is_set()
-                and not memory_pressure_event.is_set()
+                and not _auction_memory_blocked()
                 and not auction_user_job_active_event.is_set()
             )
             if healthy:
@@ -9556,7 +9614,7 @@ def fetch_ebay_html_with_fixed_pair():
             _queue_restart_sticky_persist(old_proxy, force=False)
             return html
 
-        # V6.35: cadence-health учитывает ТОЛЬКО основную загрузку, не background proxy noise.
+        # V6.36: cadence-health учитывает ТОЛЬКО основную загрузку, не background proxy noise.
         # 403/429/challenge/http_error сильнее обычного transport timeout.
         if result in ('blocked', 'rate_limited', 'http_error'):
             adaptive_mark_main_issue(2, f'fixed_{result}')
@@ -11197,6 +11255,73 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
                 pass
 
 
+def _search_continuity_accept(current_ids):
+    """Return True only for a result set continuous with the last trusted top page.
+
+    Normal newest-sort movement (1-15 new IDs) has huge overlap and passes immediately.
+    A proxy/eBay variant that suddenly replaces almost all 60 cards is quarantined BEFORE
+    seen_items is mutated, preventing a 60-message false burst.
+    """
+    global search_continuity_trusted_ids, search_continuity_last_warn
+    ids = {str(x) for x in current_ids if x}
+    if not SEARCH_CONTINUITY_GUARD_ENABLED or not ids:
+        with search_continuity_lock:
+            search_continuity_trusted_ids = set(ids)
+        return True
+
+    with search_continuity_lock:
+        trusted = set(search_continuity_trusted_ids)
+
+    # First main page after process start: durable DB provides a one-time sanity check.
+    if not trusted:
+        if len(ids) >= SEARCH_CONTINUITY_MIN_ITEMS:
+            try:
+                unseen = peek_unseen_seen_ids(list(ids))
+            except Exception as e:
+                logging.info(f"🛡 Continuity cold-check skipped after DB error: {e}")
+                unseen = set()
+            if len(unseen) >= SEARCH_CONTINUITY_COLD_MASS_NEW:
+                adaptive_mark_main_issue(1, 'cold_mass_new_result_set')
+                logging.warning(
+                    f"🛡 Search continuity HOLD: cold page has {len(unseen)}/{len(ids)} unseen IDs; "
+                    "seen_items НЕ меняем и Telegram НЕ рассылаем до нормальной выдачи"
+                )
+                return False
+        with search_continuity_lock:
+            search_continuity_trusted_ids = set(ids)
+        return True
+
+    if len(ids) >= SEARCH_CONTINUITY_MIN_ITEMS and len(trusted) >= SEARCH_CONTINUITY_MIN_ITEMS:
+        overlap_count = len(ids & trusted)
+        overlap_ratio = overlap_count / float(min(len(ids), len(trusted)))
+        if overlap_ratio < SEARCH_CONTINUITY_MIN_OVERLAP:
+            adaptive_mark_main_issue(1, 'search_result_discontinuity')
+            now_mono = time.monotonic()
+            with search_continuity_lock:
+                do_log = (now_mono - search_continuity_last_warn) >= SEARCH_CONTINUITY_WARN_INTERVAL
+                if do_log:
+                    search_continuity_last_warn = now_mono
+            if do_log:
+                logging.warning(
+                    f"🛡 Search continuity HOLD: overlap={overlap_count}/{min(len(ids), len(trusted))} "
+                    f"({overlap_ratio:.0%}) < {SEARCH_CONTINUITY_MIN_OVERLAP:.0%}; "
+                    "похоже на альтернативную выдачу eBay/proxy. seen_items и Telegram не трогаем."
+                )
+            return False
+
+    with search_continuity_lock:
+        search_continuity_trusted_ids = set(ids)
+    return True
+
+
+def _search_continuity_seed(current_ids):
+    global search_continuity_trusted_ids
+    if not SEARCH_CONTINUITY_GUARD_ENABLED:
+        return
+    with search_continuity_lock:
+        search_continuity_trusted_ids = {str(x) for x in current_ids if x}
+
+
 def perform_initial_snapshot():
     logging.info("Начальный снимок...")
     html = fetch_ebay_html_with_retry()
@@ -11207,6 +11332,7 @@ def perform_initial_snapshot():
     _memory_maintenance('initial snapshot', force=False)
     if not items:
         return False
+    _search_continuity_seed(items.keys())
     add_seen_ids_batch(list(items.keys()))
     logging.info(f"Снимок: {len(items)} товаров")
     return True
@@ -11304,6 +11430,9 @@ def check_and_send_new_items():
     if not current:
         logging.info("Основная выдача eBay распознана, но подходящих карточек нет")
         return 'ok'
+
+    if not _search_continuity_accept(current.keys()):
+        return 'continuity_hold'
 
     # Атомарно claim только текущие item_id. После claim товар больше не будет считаться
     # новым даже при overlap Render instances. Уведомления отправляем ПО ОДНОМУ сразу,
@@ -11496,7 +11625,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.35 AUCTION-EXACT-NOW PriceGuard работает." +
+        "\n🇺🇸 eBay США monitor v6.36 CONTINUITY-MEMORY-GUARD работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -11515,7 +11644,7 @@ def bot_worker():
             cadence_mode, cadence_reasons = adaptive_finish_main_cycle(result)
 
             if result == 'ok':
-                # V6.35: cadence считается от НАЧАЛА цикла и верхняя граница зависит
+                # V6.36: cadence считается от НАЧАЛА цикла и верхняя граница зависит
                 # только от здоровья MAIN monitor: stable 10-14, cautious 10-18, stressed 10-22.
                 cadence_mode, target_cadence, cadence_low, cadence_high = adaptive_pick_target_cadence()
                 wait = max(MAIN_CYCLE_MIN_SLEEP, target_cadence - cycle_elapsed)
@@ -11524,15 +11653,23 @@ def bot_worker():
                     f"adaptive={cadence_mode} ({cadence_low:.0f}-{cadence_high:.0f} сек.), "
                     f"target={target_cadence:.1f}; следующая через {wait:.1f} сек."
                 )
-            elif result == 'parse_error':
-                # HTTP 200 был доступен, но DOM не распознан: cautious cadence без смены proxy.
+            elif result in ('parse_error', 'continuity_hold'):
+                # HTTP 200 был доступен. DOM-error или continuity quarantine не требуют
+                # proxy rotation; просто повторяем основной search в cautious cadence.
                 cadence_mode, target_cadence, cadence_low, cadence_high = adaptive_pick_target_cadence()
                 wait = max(MAIN_CYCLE_MIN_SLEEP, target_cadence - cycle_elapsed)
-                logging.warning(
-                    f"⚠️ eBay доступен, но разметка не распознана. Цикл {cycle_elapsed:.1f} сек.; "
-                    f"adaptive={cadence_mode} ({cadence_low:.0f}-{cadence_high:.0f} сек.), "
-                    f"повтор через {wait:.1f} сек. без смены proxy."
-                )
+                if result == 'parse_error':
+                    logging.warning(
+                        f"⚠️ eBay доступен, но разметка не распознана. Цикл {cycle_elapsed:.1f} сек.; "
+                        f"adaptive={cadence_mode} ({cadence_low:.0f}-{cadence_high:.0f} сек.), "
+                        f"повтор через {wait:.1f} сек. без смены proxy."
+                    )
+                else:
+                    logging.warning(
+                        f"🛡 Альтернативная выдача eBay временно удержана. Цикл {cycle_elapsed:.1f} сек.; "
+                        f"adaptive={cadence_mode} ({cadence_low:.0f}-{cadence_high:.0f} сек.), "
+                        f"повтор через {wait:.1f} сек.; новые ID пока НЕ записаны."
+                    )
             else:
                 # Реальная проблема загрузки/proxy: discovery уже сам потратил время.
                 # Оставляем прежний короткий 3-5s retry, чтобы не устроить busy-loop.
@@ -11580,7 +11717,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.35 AUCTION-EXACT-NOW: "
+        "🌐 Multi-provider v6.36 CONTINUITY-MEMORY-GUARD: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"order=FREE→Premium@{PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS}attempts"
@@ -11595,10 +11732,22 @@ def start_leader_workers():
     )
     rss = _memory_rss_mb()
     logging.info(
-        f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/high/emergency={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
+        f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/high/clear/emergency/auction-pause="
+        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB; "
         f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}" if rss is not None else
-        f"🧠 MemorySafe enabled: soft/high/emergency={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB"
+        f"🧠 MemorySafe enabled: soft/high/clear/emergency/auction-pause="
+        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB"
     )
+    logging.info(
+        f"🛡 Search continuity: ON={SEARCH_CONTINUITY_GUARD_ENABLED}, "
+        f"min_items={SEARCH_CONTINUITY_MIN_ITEMS}, min_overlap={SEARCH_CONTINUITY_MIN_OVERLAP:.0%}, "
+        f"cold_mass={SEARCH_CONTINUITY_COLD_MASS_NEW}"
+    )
+    if CHECK_INTERVAL > 10:
+        logging.info(
+            f"ℹ️ CHECK_INTERVAL={CHECK_INTERVAL}: фактические adaptive окна начинаются с {CHECK_INTERVAL} сек. "
+            "Для режима 10-14/10-18/10-22 установите CHECK_INTERVAL=10 в Render."
+        )
 
     configure_telegram_bot_ui()
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
@@ -11648,7 +11797,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.35 AuctionExactNow, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.36 ContinuityMemory, {role})"
 
 
 @app.route('/health')
