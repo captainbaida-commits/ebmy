@@ -18,7 +18,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Tag, SoupStrainer
 from flask import Flask
 from dotenv import load_dotenv
 import psycopg2
@@ -384,24 +384,32 @@ FIXED_RECOVERY_SKIP_AFTER = max(
     8.0, float(os.getenv("FIXED_RECOVERY_SKIP_AFTER", "18"))
 )
 
-# V6.36 MEMORY HYSTERESIS. Current US production has a stable post-trim baseline around
-# 460-470 MB. The old 450/360 high/clear pair became a one-way latch: once HIGH was set,
-# RSS could never fall to 360 MB, so auction/status workers stayed paused indefinitely.
-# Keep enough headroom below Render's 512 MB cap while making HIGH a transient spike state.
+# V6.38 MEMORY HEADROOM for Render 512 MB.
+# Production logs showed a post-trim RSS around 468-474 MB and Render later killed the
+# instance above 512 MB. That leaves too little room for a 1.5 MB eBay response plus a
+# BeautifulSoup tree / concurrent discovery responses. Protect earlier, but keep exact
+# auction reminders DB-driven and user auction work available until genuinely near danger.
 MEMORY_GUARD_ENABLED = (os.getenv("MEMORY_GUARD_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off"))
-MEMORY_GUARD_INTERVAL = max(5.0, float(os.getenv("MEMORY_GUARD_INTERVAL", "10")))
-MEMORY_SOFT_MB = max(300, int(os.getenv("MEMORY_SOFT_MB", "455")))
-MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 10, int(os.getenv("MEMORY_HIGH_MB", "475")))
-MEMORY_EMERGENCY_MB = max(MEMORY_HIGH_MB + 10, min(int(os.getenv("MEMORY_EMERGENCY_MB", "490")), 500))
+MEMORY_GUARD_INTERVAL = max(4.0, float(os.getenv("MEMORY_GUARD_INTERVAL", "7")))
+MEMORY_SOFT_MB = max(300, int(os.getenv("MEMORY_SOFT_MB", "425")))
+MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 10, int(os.getenv("MEMORY_HIGH_MB", "450")))
+MEMORY_EMERGENCY_MB = max(MEMORY_HIGH_MB + 10, min(int(os.getenv("MEMORY_EMERGENCY_MB", "480")), 495))
 MEMORY_CLEAR_MB = min(
     MEMORY_HIGH_MB - 4,
-    max(MEMORY_SOFT_MB - 10, int(os.getenv("MEMORY_CLEAR_MB", "465"))),
+    max(MEMORY_SOFT_MB, int(os.getenv("MEMORY_CLEAR_MB", "438"))),
 )
-# User-submitted auction enrichment is sequential and important. It may run under ordinary
-# HIGH pressure after a forced trim, but not when RSS remains near the emergency ceiling.
+# New-item detail parsing is optional; skip it near the ceiling and send the already
+# sanitized search-card values immediately rather than risking OOM or notification delay.
+MEMORY_DETAIL_SKIP_MB = min(
+    MEMORY_EMERGENCY_MB - 4,
+    max(MEMORY_HIGH_MB + 8, int(os.getenv("MEMORY_DETAIL_SKIP_MB", "470"))),
+)
+# User-submitted auction enrichment remains higher priority than background reserve.
+# It is paused only after a forced trim still leaves us near the hard cap; the durable DB
+# queue/pending row remains intact and will resume automatically after restart/recovery.
 MEMORY_AUCTION_PAUSE_MB = min(
     MEMORY_EMERGENCY_MB - 2,
-    max(MEMORY_HIGH_MB, int(os.getenv("MEMORY_AUCTION_PAUSE_MB", "482"))),
+    max(MEMORY_HIGH_MB + 10, int(os.getenv("MEMORY_AUCTION_PAUSE_MB", "476"))),
 )
 PROXY_REPUTATION_TTL = max(1800, int(os.getenv("PROXY_REPUTATION_TTL", "21600")))
 PROXY_REPUTATION_MAX = max(1000, int(os.getenv("PROXY_REPUTATION_MAX", "7000")))
@@ -745,6 +753,7 @@ def memory_guard_worker():
         return
     last_state = None
     last_report = 0.0
+    last_auction_health = 0.0
     while True:
         try:
             rss = _memory_maintenance('guard', force=False)
@@ -765,6 +774,17 @@ def memory_guard_worker():
                 elif last_state is True:
                     logging.info(f"🧠 Memory pressure cleared: RSS≈{rss:.0f} MB")
                 last_state = high
+            # Fold durable-auction health into this existing worker: no extra thread/RAM.
+            if now_mono - last_auction_health >= 300:
+                try:
+                    exact_n, pending_n, queued_n = get_auction_durable_counts()
+                    logging.info(
+                        f"💾 Auction durable health: exact={exact_n}, pending={pending_n}, "
+                        f"queued={queued_n}; PostgreSQL=OK"
+                    )
+                except Exception as auction_health_error:
+                    logging.warning(f"⚠️ Auction durable health DB check failed: {auction_health_error}")
+                last_auction_health = now_mono
         except Exception as e:
             logging.debug(f"Memory guard skipped: {e}")
         time.sleep(MEMORY_GUARD_INTERVAL)
@@ -1502,9 +1522,13 @@ class ProviderManager:
                 f"[{', '.join(pieces)}]"
             )
 
-    def _discover_ps_subaccount(self):
-        if self.ps_subaccount_id or not PROXYSCRAPE_PREMIUM_API_KEY:
+    def _discover_ps_subaccount(self, force=False):
+        if not PROXYSCRAPE_PREMIUM_API_KEY:
+            return ''
+        if self.ps_subaccount_id and not force:
             return self.ps_subaccount_id
+        if force:
+            self.ps_subaccount_id = ''
         try:
             resp = requests.get(
                 'https://api.proxyscrape.com/v4/account/subaccounts',
@@ -1539,49 +1563,70 @@ class ProviderManager:
         with self.lock:
             if self.provider_circuit_until['proxyscrape_premium'] > now:
                 return None
-        sid = self._discover_ps_subaccount()
-        if not sid:
-            return None
-        url = f'https://api.proxyscrape.com/v4/account/{sid}/datacenter_shared/proxy-list'
+
         params = {
             'type': 'displayproxies', 'protocol': 'http', 'format': 'credentials',
             'credential_format': 3, 'status': 'online', 'limit': 500,
         }
-        try:
-            resp = requests.get(
-                url, headers={'api-token': PROXYSCRAPE_PREMIUM_API_KEY},
-                params=params, timeout=PROVIDER_API_TIMEOUT,
-            )
-            if resp.status_code in (401, 403, 404, 410):
-                logging.warning(
-                    f"ProxyScrape Premium API HTTP {resp.status_code}; Premium disabled for 30 min, free/Webshare continue"
+
+        # A user can replace only the API key in Render while an old
+        # PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID remains configured. v6.37 then got HTTP 401
+        # and disabled Premium for 30 minutes. v6.38 treats the first auth/not-found as
+        # a stale subaccount hint: auto-discover once with the CURRENT key and retry once.
+        auth_retry_used = False
+        while True:
+            sid = self._discover_ps_subaccount(force=auth_retry_used)
+            if not sid:
+                return None
+            url = f'https://api.proxyscrape.com/v4/account/{sid}/datacenter_shared/proxy-list'
+            try:
+                resp = requests.get(
+                    url, headers={'api-token': PROXYSCRAPE_PREMIUM_API_KEY},
+                    params=params, timeout=PROVIDER_API_TIMEOUT,
                 )
-                with self.lock:
-                    self.proxy_sets['proxyscrape_premium'] = set()
-                    self.provider_circuit_until['proxyscrape_premium'] = time.time() + 1800
-                    self.last_refresh['proxyscrape_premium'] = time.time()
-                return []
-            if resp.status_code == 429:
-                with self.lock:
-                    self.provider_circuit_until['proxyscrape_premium'] = time.time() + 300
+                if resp.status_code in (401, 403, 404, 410):
+                    if not auth_retry_used:
+                        stale_sid = sid
+                        auth_retry_used = True
+                        logging.warning(
+                            f"ProxyScrape Premium API HTTP {resp.status_code} for configured subaccount; "
+                            "re-discovering subaccount once with the current API key before circuit-break"
+                        )
+                        # Force discovery on next loop. Never log API key/secret.
+                        self.ps_subaccount_id = ''
+                        continue
+                    logging.warning(
+                        f"ProxyScrape Premium API HTTP {resp.status_code} after subaccount refresh; "
+                        "Premium disabled for 30 min, free/Webshare continue"
+                    )
+                    with self.lock:
+                        self.proxy_sets['proxyscrape_premium'] = set()
+                        self.provider_circuit_until['proxyscrape_premium'] = time.time() + 1800
+                        self.last_refresh['proxyscrape_premium'] = time.time()
+                    return []
+                if resp.status_code == 429:
+                    with self.lock:
+                        self.provider_circuit_until['proxyscrape_premium'] = time.time() + 300
+                    return None
+                if resp.status_code != 200:
+                    msg = (resp.text or '')[:180].replace('\n', ' ')
+                    logging.warning(f"ProxyScrape Premium API: HTTP {resp.status_code}: {msg}; keep old snapshot")
+                    return None
+                out = []
+                for raw in resp.text.splitlines():
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    if '://' not in line:
+                        line = 'http://' + line
+                    if _proxy_scheme(line) in ('http', 'https'):
+                        out.append(line)
+                if auth_retry_used:
+                    logging.info('🔷 ProxyScrape Premium: current-key subaccount re-discovery succeeded')
+                return list(dict.fromkeys(out))
+            except Exception as e:
+                logging.warning(f"ProxyScrape Premium API unavailable: {e}; keep old snapshot")
                 return None
-            if resp.status_code != 200:
-                msg = (resp.text or '')[:180].replace('\n', ' ')
-                logging.warning(f"ProxyScrape Premium API: HTTP {resp.status_code}: {msg}; keep old snapshot")
-                return None
-            out = []
-            for raw in resp.text.splitlines():
-                line = raw.strip()
-                if not line:
-                    continue
-                if '://' not in line:
-                    line = 'http://' + line
-                if _proxy_scheme(line) in ('http', 'https'):
-                    out.append(line)
-            return list(dict.fromkeys(out))
-        except Exception as e:
-            logging.warning(f"ProxyScrape Premium API unavailable: {e}; keep old snapshot")
-            return None
 
     def refresh_all(self, force=False, include_stats=True):
         now = time.time()
@@ -10004,12 +10049,12 @@ def fetch_ebay_html_with_fixed_pair():
         # do not create more simultaneous full-page curl responses. Existing in-flight work
         # can still finish; this does NOT stop the main failover.
         if rss_now is not None and rss_now >= MEMORY_EMERGENCY_MB:
-            desired = 2
+            desired = 1
             reason = f'emergency-memory RSS≈{rss_now:.0f}MB'
         # Real protective mode starts at 450 MB by default. Check RSS directly as well as
         # the background Event so a fast discovery spike cannot wait for the next 10-sec guard tick.
         elif (rss_now is not None and rss_now >= MEMORY_HIGH_MB) or memory_pressure_event.is_set():
-            desired = PROBE_CONCURRENCY
+            desired = min(2, PROBE_CONCURRENCY)
             reason = f'high-memory RSS≈{rss_now:.0f}MB' if rss_now is not None else 'memory-pressure'
         elif elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
             desired = PROBE_DEEP_CONCURRENCY
@@ -11031,6 +11076,19 @@ def _verify_new_item_price_shipping(item, deadline_monotonic=None):
         item['_verify_status'] = 'no_fixed_session'
         return _sanitize_new_item_fast_values(item)
 
+    # Detail verification is optional enrichment. Near Render's memory ceiling the safest
+    # behavior is to send the new item immediately with sanitized search-card values.
+    rss_before_detail = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+    if rss_before_detail is not None and rss_before_detail >= MEMORY_DETAIL_SKIP_MB:
+        rss_after_trim = _memory_maintenance('price guard', force=True)
+        if rss_after_trim is not None and rss_after_trim >= MEMORY_DETAIL_SKIP_MB:
+            item['_verify_status'] = 'memory_guard'
+            logging.info(
+                f"⚡ Detail verify [{item_id}] пропущен: RSS≈{rss_after_trim:.0f} MB >= "
+                f"{MEMORY_DETAIL_SKIP_MB} MB; отправляем сразу без риска OOM"
+            )
+            return _sanitize_new_item_fast_values(item)
+
     remaining = None
     if deadline_monotonic is not None:
         remaining = float(deadline_monotonic) - time.monotonic()
@@ -11077,6 +11135,9 @@ def _verify_new_item_price_shipping(item, deadline_monotonic=None):
             return _sanitize_new_item_fast_values(item)
         html = response.text or ''
         final_url = str(getattr(response, 'url', '') or '')
+        # Drop the response object before parsing: curl_cffi/requests may otherwise keep
+        # the raw response body alive at the same time as the Python HTML string + DOM.
+        response = None
         # После получения bytes Session больше не нужна: освобождаем lock ДО BeautifulSoup,
         # чтобы auction/main worker не ждал CPU-parsing большого item page.
         main_fixed_request_lock.release()
@@ -11341,12 +11402,53 @@ def _listing_link(card):
     return None
 
 
+def _parse_main_search_soup_memory_safe(html):
+    """Parse only the trusted eBay SRP results subtree when possible.
+
+    A full BeautifulSoup tree for ~1.5 MB eBay HTML can transiently allocate tens of MB.
+    On a 512 MB Render instance this was enough to cross the hard limit while background
+    proxy responses were alive. SoupStrainer keeps descendants of the result root only.
+    """
+    if not html:
+        return None
+    strainer = None
+    # Raw-string checks are cheap and avoid constructing a full DOM just to locate the root.
+    if re.search("id\\s*=\\s*['\"]srp-river-results['\"]", html, re.I):
+        strainer = SoupStrainer(id='srp-river-results')
+    elif re.search("class\\s*=\\s*['\"][^'\"]*\\bsrp-river-results\\b", html, re.I):
+        strainer = SoupStrainer(class_='srp-river-results')
+    elif re.search("class\\s*=\\s*['\"][^'\"]*\\bsrp-results\\b", html, re.I):
+        strainer = SoupStrainer(class_='srp-results')
+
+    if strainer is not None:
+        soup = BeautifulSoup(html, 'html.parser', parse_only=strainer)
+        # If eBay emitted a malformed/empty root, do not immediately build a second full DOM
+        # under high pressure. At low memory we retain compatibility with future layouts.
+        if soup.find(True) is not None:
+            return soup
+        try:
+            soup.decompose()
+        except Exception:
+            pass
+
+    rss_now = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+    if rss_now is not None and rss_now >= MEMORY_HIGH_MB:
+        logging.warning(
+            f"🧠 Main parse full-DOM fallback suppressed at RSS≈{rss_now:.0f} MB; "
+            "БД не изменяем, повторим на следующем цикле"
+        )
+        return None
+    return BeautifulSoup(html, 'html.parser')
+
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return None
     soup = None
     try:
-        soup = BeautifulSoup(html, 'html.parser')
+        soup = _parse_main_search_soup_memory_safe(html)
+        if soup is None:
+            return None
         cards = _main_search_result_cards(soup)
         if cards is None:
             return None
@@ -11823,7 +11925,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.37 SOFT-SHELL-RECOVERY работает." +
+        "\n🇺🇸 eBay США monitor v6.38 MEMORY-AUCTION-RESILIENT работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -11915,7 +12017,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.37 SOFT-SHELL-RECOVERY: "
+        "🌐 Multi-provider v6.38 MEMORY-AUCTION-RESILIENT: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"order=FREE→Premium@{PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS}attempts"
@@ -11931,7 +12033,7 @@ def start_leader_workers():
     rss = _memory_rss_mb()
     logging.info(
         f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/high/clear/emergency/auction-pause="
-        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB; "
+        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB; detail-skip={MEMORY_DETAIL_SKIP_MB} MB; "
         f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}" if rss is not None else
         f"🧠 MemorySafe enabled: soft/high/clear/emergency/auction-pause="
         f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB"
@@ -12000,7 +12102,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.37 SoftShellRecovery, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.38 MemoryAuctionResilient, {role})"
 
 
 @app.route('/health')
