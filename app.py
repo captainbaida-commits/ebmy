@@ -384,6 +384,10 @@ FIXED_RECOVERY_SKIP_AFTER = max(
     8.0, float(os.getenv("FIXED_RECOVERY_SKIP_AFTER", "18"))
 )
 
+# V6.40 CURRENCY HARDENING: keep V6.39 burst distrust, but avoid two edge cases found
+# in pre-deploy audit: prose like "From $13.99" must not be mistaken for a foreign
+# currency prefix, and schema.org meta[itemprop=price] is trusted only with explicit USD
+# currency context. Fast fallbacks are normalized before Telegram output.
 # V6.38 MEMORY HEADROOM for Render 512 MB.
 # Production logs showed a post-trim RSS around 468-474 MB and Render later killed the
 # instance above 512 MB. That leaves too little room for a 1.5 MB eBay response plus a
@@ -10623,34 +10627,82 @@ def clean_title(title):
 
 
 def is_usd_price(text):
-    """True only when the displayed amount is US dollars, not CAD/AUD/etc."""
+    """True only when the displayed amount is genuinely US dollars.
+
+    eBay may localize a US search page to the proxy country and show values such as
+    ``R$ 72.22`` (Brazilian real), ``C$``, ``AU $`` or ``NT$``. Explicit ``US $`` /
+    ``USD`` always wins. Foreign-dollar rejection is intentionally based on known
+    currency prefixes rather than a generic ``[A-Z]{1,4}$`` rule: the generic rule
+    falsely rejected normal English labels such as ``From $13.99`` / ``Now $9``.
+    """
     if not text:
         return False
     raw = html_lib.unescape(str(text))
-    # Explicit USD wins even when the same line also contains an approximate foreign value.
-    if re.search(r'\bUSD\b|\bUS\s*\$', raw, re.I):
+
+    if re.search(r'\bUSD\b|\bUS\s*\$|\bU\.S\.\s*\$', raw, re.I):
         return True
-    # Common foreign-dollar forms on eBay must not be mistaken for a bare US '$'.
-    if re.search(r'\b(?:CAD|AUD|NZD|HKD|SGD)\b|\b(?:C|CA|AU|A|NZ|HK|S)\s*\$', raw, re.I):
+
+    foreign_dollar_prefix = re.compile(
+        r'(?<![A-Za-z])(?:'
+        r'R|C|CA|AU|NZ|HK|S|SG|NT|TW|MX|AR|CL|CO|COP|TT|EC|BZ|BBD|FJ|GY|JM|KY|LR|NA'
+        r')\s*\$',
+        re.I,
+    )
+    if foreign_dollar_prefix.search(raw):
         return False
-    if re.search(r'\b(?:GBP|EUR|JPY|CNY|RMB)\b|[£€¥]', raw, re.I):
+    # Australian shorthand A$ is common, but "a $10 item" is ordinary prose.
+    if re.search(r'(?<![A-Za-z])A\$', raw, re.I):
         return False
+
+    if re.search(
+        r'\b(?:CAD|AUD|NZD|HKD|SGD|BRL|MXN|TWD|ARS|CLP|COP|GBP|EUR|JPY|CNY|RMB|THB|INR|KRW)\b'
+        r'|[£€¥₹₩฿]',
+        raw,
+        re.I,
+    ):
+        return False
+
     return '$' in raw
 
 
 def _extract_usd_amount(text):
-    """Return one normalized '$12.34' amount from text, or None for non-USD text."""
-    if not is_usd_price(text):
+    """Return one normalized '$12.34' USD amount, or None for non-USD text.
+
+    Search explicit ``US $`` / ``USD`` *before* a bare dollar sign. A localized line
+    can contain both ``R$ 72.22`` and ``US $13.91``; explicit USD must win.
+    """
+    if not text:
         return None
     raw = html_lib.unescape(str(text))
-    m = re.search(
-        r'(?:\bUSD\s*\$?\s*|\bUS\s*\$\s*|\$\s*)([\d,]+(?:\.\d{1,2})?)',
-        raw, re.I,
-    )
-    if not m:
-        return None
-    return f"${m.group(1)}"
 
+    explicit = re.search(
+        r'(?:\bUSD\s*\$?\s*|\bUS\s*\$\s*|\bU\.S\.\s*\$\s*)([\d,]+(?:\.\d{1,2})?)',
+        raw,
+        re.I,
+    )
+    if explicit:
+        return f"${explicit.group(1)}"
+
+    if not is_usd_price(raw):
+        return None
+
+    bare = re.search(r'(?<![A-Za-z])\$\s*([\d,]+(?:\.\d{1,2})?)', raw)
+    if not bare:
+        return None
+    return f"${bare.group(1)}"
+
+
+def _sanitize_usd_price_value(value):
+    """Normalize one search-card price/range without silently collapsing a range."""
+    if not value:
+        return None
+    raw = str(value).strip()
+    if ' до ' in raw:
+        lo_raw, hi_raw = raw.split(' до ', 1)
+        lo = _extract_usd_amount(lo_raw)
+        hi = _extract_usd_amount(hi_raw)
+        return f"{lo} до {hi}" if lo and hi else None
+    return _extract_usd_amount(raw)
 
 def extract_range_price(card):
     price_spans = card.select('span.s-card__price, span.s-item__price, [class*="price"]')
@@ -10919,9 +10971,25 @@ def _parse_us_item_detail_price_shipping(html, expected_item_id=None):
             if verified_price:
                 break
 
-        # 2) Explicit item-price meta is still strong and does not scan arbitrary text.
+        # 2) schema.org item-price meta is trusted ONLY with explicit USD context.
+        # A proxy-localized page can expose e.g. content="72.22" for BRL; treating that
+        # bare numeric meta as USD would defeat the visible-DOM currency guard.
         if verified_price is None:
             for elem in soup.select('meta[itemprop="price"]'):
+                currency = None
+                scope = elem.parent
+                if scope is not None and hasattr(scope, 'select_one'):
+                    cur = scope.select_one('meta[itemprop="priceCurrency"]')
+                    if cur is not None:
+                        currency = str(cur.get('content') or '').strip().upper()
+                if not currency:
+                    ancestor = elem.find_parent(attrs={'itemtype': re.compile(r'/Offer$', re.I)})
+                    if ancestor is not None:
+                        cur = ancestor.select_one('meta[itemprop="priceCurrency"]')
+                        if cur is not None:
+                            currency = str(cur.get('content') or '').strip().upper()
+                if currency != 'USD':
+                    continue
                 content = elem.get('content') or ''
                 try:
                     val = float(str(content).replace(',', ''))
@@ -11038,8 +11106,7 @@ def _sanitize_new_item_fast_values(item):
     currencies, generic logistics text and ambiguous values are never sent as a price.
     """
     price = item.get('price')
-    if not price or not is_usd_price(str(price)):
-        item['price'] = None
+    item['price'] = _sanitize_usd_price_value(price)
 
     shipping = item.get('shipping')
     if shipping:
@@ -11052,6 +11119,63 @@ def _sanitize_new_item_fast_values(item):
         else:
             item['shipping'] = None
     else:
+        item['shipping'] = None
+    return item
+
+
+
+def _usd_number(value):
+    """Parse a normalized USD string into float for trust diagnostics only."""
+    if not value:
+        return None
+    amount = _extract_usd_amount(str(value))
+    if not amount:
+        return None
+    try:
+        return float(amount[1:].replace(',', ''))
+    except Exception:
+        return None
+
+
+def _detail_result_invalidates_search_fallback(before_item, after_item):
+    """Return True when one verified item proves the current SRP money values unsafe.
+
+    This is a burst-level guard, not a price correction algorithm.  We never infer an
+    exchange rate.  Once a verified detail page shows a large mismatch (or a fixed-price
+    card had no trustworthy USD price at all), all *unverified* items from the same SRP
+    response are sent with «не определена» rather than a potentially localized amount.
+    """
+    if str(after_item.get('_verify_status') or '') != 'verified':
+        return False
+    if after_item.get('auction'):
+        # Auction current-bid semantics differ; do not calibrate a whole page from it.
+        return False
+
+    before_price = _usd_number(before_item.get('price'))
+    after_price = _usd_number(after_item.get('price'))
+    if after_price is not None:
+        if before_price is None:
+            return True
+        low = min(before_price, after_price)
+        high = max(before_price, after_price)
+        if low > 0 and (high / low) >= 1.35:
+            return True
+
+    before_shipping = before_item.get('shipping')
+    after_shipping = after_item.get('shipping')
+    if after_shipping:
+        if before_shipping and not (
+            str(before_shipping).strip().lower() in ('бесплатно', 'free', 'free shipping', 'free delivery')
+            or is_usd_price(str(before_shipping))
+        ):
+            return True
+    return False
+
+
+def _drop_unverified_search_money(item):
+    """When the whole SRP burst is distrusted, never send unverified money values."""
+    if str(item.get('_verify_status') or '') != 'verified':
+        item['price'] = None
         item['shipping'] = None
     return item
 
@@ -11623,12 +11747,12 @@ def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is
     Unknown logistics text (for example ``delivery in 3 days``) is deliberately NOT
     interpreted as a numeric shipping cost. This avoids false totals in Telegram.
     """
-    if not price_str or "до" in price_str or not is_usd_price(price_str):
-        return None
-
     source_price = price_str
     if is_auction and buy_it_now_price_str and is_usd_price(buy_it_now_price_str):
         source_price = buy_it_now_price_str
+
+    if not source_price or "до" in str(source_price) or not is_usd_price(source_price):
+        return None
 
     price_amount = _extract_usd_amount(source_price)
     if not price_amount:
@@ -11748,14 +11872,31 @@ def check_and_send_new_items():
 
     verify_deadline = time.monotonic() + PRICE_VERIFY_BURST_BUDGET
     total_new = len(claimed_items)
+    # V6.39: one strong detail mismatch can prove that the whole current SRP was
+    # localized (for example Brazilian R$ rendered through a proxy).  In that case
+    # verified items keep their detail values, while later budget-exhausted/error
+    # items are sent immediately with money marked «не определена».
+    burst_search_money_trusted = True
     logging.info(
         f"⚡ Новых товаров: {total_new}; общий быстрый PriceGuard budget="
         f"{PRICE_VERIFY_BURST_BUDGET:.1f} сек. После него отправка продолжается без ожидания detail-page."
     )
 
     for idx, (item_id, data) in enumerate(claimed_items, start=1):
+        before_verify = {'price': data.get('price'), 'shipping': data.get('shipping')}
         item = {'id': item_id, **data}
         item = _verify_new_item_price_shipping(item, deadline_monotonic=verify_deadline)
+
+        if burst_search_money_trusted and _detail_result_invalidates_search_fallback(before_verify, item):
+            burst_search_money_trusted = False
+            logging.warning(
+                f"🛡 PriceGuard burst distrust [{item_id}]: detail-page показала, что денежные "
+                "значения текущей search-page локализованы/ненадёжны. Остальные непроверенные "
+                "товары этого цикла отправляем без цены/доставки, а не с ошибочными суммами."
+            )
+
+        if not burst_search_money_trusted:
+            _drop_unverified_search_money(item)
 
         logging.info(
             f"НОВЫЙ [{item_id}] ({idx}/{total_new}): {item['title'][:50]}... "
@@ -11925,7 +12066,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.38 MEMORY-AUCTION-RESILIENT работает." +
+        "\n🇺🇸 eBay США monitor v6.40 CURRENCY-HARDENED работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -12017,7 +12158,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.38 MEMORY-AUCTION-RESILIENT: "
+        "🌐 Multi-provider v6.40 CURRENCY-HARDENED: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"order=FREE→Premium@{PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS}attempts"
@@ -12102,7 +12243,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.38 MemoryAuctionResilient, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.40 CurrencyHardened, {role})"
 
 
 @app.route('/health')
