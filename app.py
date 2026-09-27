@@ -94,6 +94,19 @@ SEARCH_CONTINUITY_MIN_OVERLAP = max(0.15, min(float(os.getenv("SEARCH_CONTINUITY
 # Cold-process protection: if there is no in-RAM trusted page yet, a page where almost
 # everything is unseen in the durable DB is quarantined instead of flooding Telegram.
 SEARCH_CONTINUITY_COLD_MASS_NEW = max(30, min(int(os.getenv("SEARCH_CONTINUITY_COLD_MASS_NEW", "50")), 60))
+# After a restart there is intentionally no in-RAM trusted fingerprint. If the bot was
+# offline long enough, 50+ genuinely new items may be present. One suspicious cold page is
+# still quarantined, but TWO highly-overlapping cold pages confirm the new universe and let
+# monitoring resume instead of remaining stuck forever after a restart.
+SEARCH_CONTINUITY_COLD_CONFIRMATIONS = max(
+    2, min(int(os.getenv("SEARCH_CONTINUITY_COLD_CONFIRMATIONS", "2")), 4)
+)
+SEARCH_CONTINUITY_COLD_CONFIRM_WINDOW = max(
+    20.0, min(float(os.getenv("SEARCH_CONTINUITY_COLD_CONFIRM_WINDOW", "60")), 180.0)
+)
+SEARCH_CONTINUITY_COLD_CONFIRM_OVERLAP = max(
+    0.60, min(float(os.getenv("SEARCH_CONTINUITY_COLD_CONFIRM_OVERLAP", "0.75")), 0.95)
+)
 SEARCH_CONTINUITY_WARN_INTERVAL = max(10.0, float(os.getenv("SEARCH_CONTINUITY_WARN_INTERVAL", "30")))
 
 # V6.37 SEARCH-SOFT-SHELL GUARD.
@@ -388,56 +401,100 @@ FIXED_RECOVERY_SKIP_AFTER = max(
 # in pre-deploy audit: prose like "From $13.99" must not be mistaken for a foreign
 # currency prefix, and schema.org meta[itemprop=price] is trusted only with explicit USD
 # currency context. Fast fallbacks are normalized before Telegram output.
-# V6.38 MEMORY HEADROOM for Render 512 MB.
-# Production logs showed a post-trim RSS around 468-474 MB and Render later killed the
-# instance above 512 MB. That leaves too little room for a 1.5 MB eBay response plus a
-# BeautifulSoup tree / concurrent discovery responses. Protect earlier, but keep exact
-# auction reminders DB-driven and user auction work available until genuinely near danger.
+# V6.44 MEMORY FUSE for Render 512 MB.
+# The post-restart production log is healthy (~227-326 MB), while the OOM incident happened
+# only after the process had accumulated much more native/parser state. Keep the normal fast
+# path untouched at healthy RSS, but start shedding OPTIONAL background work much earlier
+# than Render's hard 512-MB kill. Stale ENV values from older versions are safety-clamped.
 MEMORY_GUARD_ENABLED = (os.getenv("MEMORY_GUARD_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off"))
-MEMORY_GUARD_INTERVAL = max(4.0, float(os.getenv("MEMORY_GUARD_INTERVAL", "7")))
-MEMORY_SOFT_MB = max(300, int(os.getenv("MEMORY_SOFT_MB", "425")))
-MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 10, int(os.getenv("MEMORY_HIGH_MB", "450")))
-MEMORY_EMERGENCY_MB = max(MEMORY_HIGH_MB + 10, min(int(os.getenv("MEMORY_EMERGENCY_MB", "480")), 495))
+MEMORY_GUARD_INTERVAL = max(4.0, min(float(os.getenv("MEMORY_GUARD_INTERVAL", "5")), 10.0))
+
+_raw_memory_soft = int(os.getenv("MEMORY_SOFT_MB", "390"))
+MEMORY_SOFT_MB = max(300, min(_raw_memory_soft, 410))
+_raw_memory_high = int(os.getenv("MEMORY_HIGH_MB", "430"))
+MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 15, min(_raw_memory_high, 440))
 MEMORY_CLEAR_MB = min(
-    MEMORY_HIGH_MB - 4,
-    max(
-        MEMORY_HIGH_MB - 6,
-        MEMORY_SOFT_MB,
-        int(os.getenv("MEMORY_CLEAR_MB", "446")),
-    ),
+    MEMORY_HIGH_MB - 10,
+    max(MEMORY_SOFT_MB, int(os.getenv("MEMORY_CLEAR_MB", "410"))),
 )
-# New-item detail parsing is optional; skip it near the ceiling and send the already
-# sanitized search-card values immediately rather than risking OOM or notification delay.
+MEMORY_EMERGENCY_MB = max(
+    MEMORY_HIGH_MB + 15,
+    min(int(os.getenv("MEMORY_EMERGENCY_MB", "468")), 475),
+)
+
+# New-item detail parsing is optional; skip it before the main monitor itself is at risk.
 MEMORY_DETAIL_SKIP_MB = min(
-    MEMORY_EMERGENCY_MB - 4,
-    max(MEMORY_HIGH_MB + 8, int(os.getenv("MEMORY_DETAIL_SKIP_MB", "470"))),
+    MEMORY_EMERGENCY_MB - 8,
+    max(MEMORY_HIGH_MB + 5, int(os.getenv("MEMORY_DETAIL_SKIP_MB", "445"))),
 )
-# User-submitted auction enrichment remains higher priority than background reserve.
-# It is paused only after a forced trim still leaves us near the hard cap; the durable DB
-# queue/pending row remains intact and will resume automatically after restart/recovery.
+
+# User-submitted auction enrichment stays high priority. Background status checks are paused
+# already at HIGH pressure, while a newly submitted user auction is blocked only very near
+# the real ceiling. Its durable DB row remains intact across any restart.
 MEMORY_AUCTION_PAUSE_MB = min(
-    MEMORY_EMERGENCY_MB - 2,
-    max(MEMORY_HIGH_MB + 10, int(os.getenv("MEMORY_AUCTION_PAUSE_MB", "476"))),
+    480,
+    max(MEMORY_EMERGENCY_MB + 4, int(os.getenv("MEMORY_AUCTION_PAUSE_MB", "478"))),
 )
 
-# V6.42: before abandoning a healthy HTTP-200 search page merely because RSS crossed
-# MEMORY_HIGH_MB, force GC+malloc_trim and allow ONE full-DOM rescue only if memory
-# falls back to a safe starting level. Production logs repeatedly showed 451-453 -> 444 MB
-# after trim, so skipping those pages cost minutes of monitoring for no real OOM benefit.
-MEMORY_FULL_DOM_RESCUE_MAX_MB = min(
-    MEMORY_HIGH_MB - 2,
-    max(MEMORY_SOFT_MB + 5, int(os.getenv("MEMORY_FULL_DOM_RESCUE_MAX_MB", "446"))),
+# A full BeautifulSoup DOM is deliberately a LAST resort. Normal eBay pages are handled by
+# root/card-only parsing; this fallback is used only with generous headroom.
+MEMORY_FULL_DOM_FALLBACK_MAX_MB = min(
+    MEMORY_HIGH_MB - 25,
+    max(340, int(os.getenv("MEMORY_FULL_DOM_FALLBACK_MAX_MB", "380"))),
 )
 
-# Repeated HTTP-200 parse errors on the SAME fixed proxy are strongly correlated in the
-# production log with that IP soon turning 403. First failure gets a fast retry; the
-# second consecutive one soft-rotates the fixed proxy instead of sleeping 10-22 seconds.
-PARSE_ERROR_FAST_RETRY_MIN = max(1.0, min(float(os.getenv("PARSE_ERROR_FAST_RETRY_MIN", "2.0")), 5.0))
+# Proactive memory controls have NO effect during the healthy 200-350 MB regime seen after
+# restart. They activate only if RSS begins drifting upward over a long uptime.
+MEMORY_PROACTIVE_TRIM_MB = min(
+    MEMORY_HIGH_MB - 20,
+    max(340, int(os.getenv("MEMORY_PROACTIVE_TRIM_MB", "380"))),
+)
+MEMORY_PROACTIVE_TRIM_COOLDOWN = max(
+    15.0, float(os.getenv("MEMORY_PROACTIVE_TRIM_COOLDOWN", "30"))
+)
+MEMORY_SESSION_RECYCLE_MB = min(
+    MEMORY_EMERGENCY_MB - 12,
+    max(MEMORY_HIGH_MB + 5, int(os.getenv("MEMORY_SESSION_RECYCLE_MB", "445"))),
+)
+MEMORY_SESSION_RECYCLE_COOLDOWN = max(
+    90.0, float(os.getenv("MEMORY_SESSION_RECYCLE_COOLDOWN", "240"))
+)
+
+# Last-resort controlled recycle. We first trim, shed background work and close only the
+# persistent curl session (keeping the same proxy). If RSS nevertheless remains critically
+# close to 512 MB for several guard samples, a clean process restart is safer than Render's
+# hard OOM kill. PostgreSQL durable auction/seen state and restart-sticky survive it.
+MEMORY_PANIC_MB = min(
+    500,
+    max(MEMORY_EMERGENCY_MB + 12, int(os.getenv("MEMORY_PANIC_MB", "490"))),
+)
+MEMORY_PANIC_CONFIRMATIONS = max(
+    2, min(int(os.getenv("MEMORY_PANIC_CONFIRMATIONS", "3")), 6)
+)
+MEMORY_PANIC_RESTART_ENABLED = (
+    os.getenv("MEMORY_PANIC_RESTART_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
+# A parser miss is NOT evidence that the proxy is bad.  V6.42 incorrectly rotated a
+# perfectly healthy HTTP-200 proxy after two parser misses, which amplified discovery
+# traffic and memory.  We keep a short retry, but only HTTP/network/challenge logic may
+# evict the fixed proxy.  If eBay changes markup, the continuity-safe anchor fallback
+# below can still detect new item IDs without building a full DOM.
+PARSE_ERROR_FAST_RETRY_MIN = max(2.0, min(float(os.getenv("PARSE_ERROR_FAST_RETRY_MIN", "3.0")), 6.0))
 PARSE_ERROR_FAST_RETRY_MAX = max(
     PARSE_ERROR_FAST_RETRY_MIN,
-    min(float(os.getenv("PARSE_ERROR_FAST_RETRY_MAX", "3.0")), 6.0),
+    min(float(os.getenv("PARSE_ERROR_FAST_RETRY_MAX", "5.0")), 8.0),
 )
-PARSE_ERROR_ROTATE_AFTER = max(2, min(int(os.getenv("PARSE_ERROR_ROTATE_AFTER", "2")), 4))
+RAW_ANCHOR_FALLBACK_ENABLED = (
+    os.getenv("RAW_ANCHOR_FALLBACK_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+RAW_ANCHOR_FALLBACK_MIN_OVERLAP = max(
+    0.55,
+    min(float(os.getenv("RAW_ANCHOR_FALLBACK_MIN_OVERLAP", "0.70")), 0.95),
+)
+RAW_ANCHOR_SCAN_LIMIT = max(80, min(int(os.getenv("RAW_ANCHOR_SCAN_LIMIT", "180")), 300))
 PROXY_REPUTATION_TTL = max(1800, int(os.getenv("PROXY_REPUTATION_TTL", "21600")))
 PROXY_REPUTATION_MAX = max(1000, int(os.getenv("PROXY_REPUTATION_MAX", "7000")))
 PROVIDER_UNIQUE_STATS_CAP = max(500, int(os.getenv("PROVIDER_UNIQUE_STATS_CAP", "4096")))
@@ -690,6 +747,12 @@ memory_pressure_event = threading.Event()
 db_ready_event = threading.Event()
 leader_active_event = threading.Event()
 
+# V6.44 proactive memory state. These are tiny scalars only; no history buffers.
+_memory_housekeeping_lock = threading.Lock()
+_memory_last_proactive_trim = 0.0
+_memory_last_session_recycle = 0.0
+_memory_panic_streak = 0
+
 # Счётчик seen_items загружается из PostgreSQL один раз при старте leader-копии,
 # а затем увеличивается только на реально вставленное число новых item_id.
 # Так в логах снова видно общее количество товаров без SELECT COUNT(*) каждые 15-27 сек.
@@ -763,11 +826,131 @@ def _memory_maintenance(reason='', force=False):
     return rss
 
 
+def _memory_recycle_fixed_session(reason='memory', force=False):
+    """Release persistent curl/native state without throwing away the proven proxy.
+
+    The next main request recreates a Session on the SAME proxy/profile. This is much
+    cheaper and safer than rotating a healthy endpoint merely to reclaim native buffers.
+    """
+    global fixed_session, _memory_last_session_recycle
+
+    if 'main_fixed_request_lock' not in globals():
+        return False
+    if fixed_proxy is None or fixed_profile is None or fixed_session is None:
+        return False
+    if main_discovery_active_event.is_set():
+        return False
+
+    now_mono = time.monotonic()
+    with _memory_housekeeping_lock:
+        if (
+            not force
+            and (now_mono - _memory_last_session_recycle) < MEMORY_SESSION_RECYCLE_COOLDOWN
+        ):
+            return False
+
+    acquired = main_fixed_request_lock.acquire(timeout=0.05)
+    if not acquired:
+        return False
+    old_session = None
+    try:
+        if fixed_session is None:
+            return False
+        old_session = fixed_session
+        fixed_session = None
+        with _memory_housekeeping_lock:
+            _memory_last_session_recycle = now_mono
+    finally:
+        main_fixed_request_lock.release()
+
+    close_session(old_session)
+    _release_python_memory(force_trim=True)
+    rss_after = _memory_rss_mb()
+    logging.warning(
+        f"🧠 Memory session recycle ({reason}): сохранили fixed proxy "
+        f"{_proxy_log_name(fixed_proxy)}, закрыли только curl Session; "
+        f"RSS≈{rss_after:.0f} MB" if rss_after is not None else
+        f"🧠 Memory session recycle ({reason}): сохранили fixed proxy и закрыли только curl Session"
+    )
+    return True
+
+
+def _proactive_memory_housekeeping(reason=''):
+    """Bounded, low-frequency memory shedding before Render reaches its 512-MB hard cap."""
+    global _memory_last_proactive_trim, _memory_panic_streak
+
+    rss = _memory_rss_mb()
+    if rss is None:
+        return None
+
+    now_mono = time.monotonic()
+    if rss >= MEMORY_PROACTIVE_TRIM_MB:
+        do_trim = False
+        with _memory_housekeeping_lock:
+            if (now_mono - _memory_last_proactive_trim) >= MEMORY_PROACTIVE_TRIM_COOLDOWN:
+                _memory_last_proactive_trim = now_mono
+                do_trim = True
+        if do_trim:
+            rss = _memory_maintenance(
+                f"proactive{(' ' + reason) if reason else ''}",
+                force=True,
+            )
+
+    # If RSS keeps climbing, free native curl/session state but KEEP the proven endpoint.
+    if rss is not None and rss >= MEMORY_SESSION_RECYCLE_MB:
+        if _memory_recycle_fixed_session(reason=reason or 'high RSS', force=False):
+            rss = _memory_rss_mb()
+
+    # At emergency pressure, discard only optional make-before-break state and trim again.
+    if rss is not None and rss >= MEMORY_EMERGENCY_MB:
+        memory_pressure_event.set()
+        try:
+            if 'webshare_handoff_ready' in globals():
+                _discard_webshare_handoff_ready('memory emergency')
+        except Exception:
+            pass
+        _release_python_memory(force_trim=True)
+        rss = _memory_rss_mb() or rss
+
+    if rss is not None and rss >= MEMORY_PANIC_MB:
+        with _memory_housekeeping_lock:
+            _memory_panic_streak += 1
+            panic_streak = _memory_panic_streak
+        logging.critical(
+            f"🧯 Memory PANIC: RSS≈{rss:.0f} MB after cleanup "
+            f"({panic_streak}/{MEMORY_PANIC_CONFIRMATIONS}); "
+            "background work already shed, durable PostgreSQL state remains safe"
+        )
+        if MEMORY_PANIC_RESTART_ENABLED and panic_streak >= MEMORY_PANIC_CONFIRMATIONS:
+            # Avoid an uncontrolled Render OOM kill in the middle of several concurrent
+            # native allocations. The DB queue/reminders/seen_items are already durable.
+            logging.critical(
+                "♻️ Controlled memory recycle: restarting process BEFORE Render 512-MB OOM. "
+                "After restart durable auctions/seen_items and restart-sticky are restored automatically."
+            )
+            try:
+                _queue_restart_sticky_persist(fixed_proxy, force=True)
+            except Exception:
+                pass
+            try:
+                _release_python_memory(force_trim=True)
+            except Exception:
+                pass
+            time.sleep(0.25)
+            os._exit(75)
+    else:
+        with _memory_housekeeping_lock:
+            _memory_panic_streak = 0
+
+    return rss
+
+
 def _auction_memory_blocked():
-    """Only block user auction work near the REAL emergency ceiling.
+    """Only block NEW user auction enrichment near the real emergency ceiling.
 
     A forced trim is cheap compared with leaving a user-submitted auction pending for hours.
-    Background Smart Reserve/Webshare handoff still obey the stricter HIGH-pressure event.
+    Background status verification is paused earlier at HIGH pressure, but reminders remain
+    DB-driven and continue independently.
     """
     rss = _memory_maintenance('auction gate', force=True)
     return bool(rss is not None and rss >= MEMORY_AUCTION_PAUSE_MB)
@@ -784,6 +967,7 @@ def memory_guard_worker():
     while True:
         try:
             rss = _memory_maintenance('guard', force=False)
+            rss = _proactive_memory_housekeeping('guard') if rss is not None else rss
             high = memory_pressure_event.is_set()
             now_mono = time.monotonic()
             if rss is not None and now_mono - last_report >= 300:
@@ -831,6 +1015,9 @@ adaptive_clean_streak = 0
 search_continuity_lock = threading.Lock()
 search_continuity_trusted_ids = set()
 search_continuity_last_warn = 0.0
+search_continuity_cold_candidate_ids = set()
+search_continuity_cold_candidate_count = 0
+search_continuity_cold_candidate_started = 0.0
 
 
 def adaptive_begin_main_cycle():
@@ -8424,6 +8611,11 @@ def auction_status_worker():
             healthy = (
                 (is_paused or (had_success and elapsed < 180))
                 and not main_discovery_active_event.is_set()
+                # Background exact-status refresh is useful but not urgent. Under HIGH
+                # memory pressure, reminders keep running from durable PostgreSQL while
+                # this network/parser work waits. NEW user auction jobs keep their higher
+                # MEMORY_AUCTION_PAUSE_MB threshold in auction_link_worker.
+                and not memory_pressure_event.is_set()
                 and not _auction_memory_blocked()
                 and not auction_user_job_active_event.is_set()
             )
@@ -9073,7 +9265,7 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
         )
 
         if response.status_code == 200:
-            blocked, reason = _is_ebay_block_page(response)
+            blocked, reason = _is_ebay_block_page(response, body_text)
             if blocked:
                 logging.warning(
                     f"🚫 ПОДТВЕРЖДЁННАЯ защита eBay ({reason}) "
@@ -9379,22 +9571,29 @@ def _quality_https_preflight_proxy(proxy):
 def _probe_proxy(proxy, profile, timeout, stop_event=None):
     """Одна discovery-проверка: быстрый TCP preflight -> только затем eBay.
 
-    V6.41: если другой proxy уже победил, probe, который ещё находился только
-    на дешёвом TCP-preflight, не начинает лишний полноценный eBay HTTP request.
-    Уже начавшийся curl-request не прерываем — это безопаснее для curl_cffi.
+    If another proxy wins while this curl request is already in flight, we cannot safely
+    cancel libcurl. But after it returns we immediately DROP its 1.5-1.8 MB HTML body and
+    close the temporary Session, returning only a tiny ``late_success`` signal. This keeps
+    the useful reputation signal without retaining several full pages after a winner exists.
     """
     ok, preflight_result = _tcp_preflight_proxy(proxy, force=False)
     if not ok:
         return preflight_result or 'proxy_error', None, None
     if stop_event is not None and stop_event.is_set():
         return 'cancelled', None, None
-    return _make_request(
+
+    result, html, session = _make_request(
         proxy,
         profile,
         session=None,
         timeout=timeout,
         request_kind='discovery',
     )
+    if stop_event is not None and stop_event.is_set() and result == 'success':
+        html = None
+        close_session(session)
+        return 'late_success', None, None
+    return result, html, session
 
 
 def _cleanup_late_probe_future(future, proxy):
@@ -9408,7 +9607,7 @@ def _cleanup_late_probe_future(future, proxy):
         return
 
     try:
-        if result == 'success':
+        if result in ('success', 'late_success'):
             proxy_manager.mark_success(proxy)
             logging.info(f"🟢 Запомнен запасной успешный proxy {_proxy_log_name(proxy)} (late probe)")
         elif result in ('cancelled', 'profile_error'):
@@ -9823,56 +10022,6 @@ def _quarantine_fixed_after_soft_search_shell(html):
     return False
 
 
-def _rotate_fixed_after_repeated_parse_error(streak):
-    """Soft-rotate a fixed proxy after repeated HTTP-200 but unusable search DOM.
-
-    One parse miss can be an eBay A/B/transient response and is retried quickly.
-    Two consecutive misses on the same fixed IP are different: production logs show
-    long runs of unusable 200 pages followed by 403. Rotating at that point removes
-    multi-minute blind spots without treating the IP as a hard block.
-    """
-    global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
-
-    old_proxy = None
-    old_session = None
-    acquired = main_fixed_request_lock.acquire(timeout=0.75)
-    try:
-        if not acquired or fixed_proxy is None:
-            return False
-        old_proxy = fixed_proxy
-        old_session = fixed_session
-        fixed_proxy = None
-        fixed_profile = None
-        fixed_session = None
-        fixed_pair_since_monotonic = None
-    finally:
-        if acquired:
-            main_fixed_request_lock.release()
-
-    close_session(old_session)
-    if old_proxy:
-        proxy_manager.mark_failure(
-            old_proxy,
-            'soft_blocked',
-            reason=f'repeated HTTP-200 unparseable search DOM x{streak}',
-        )
-        _auction_proxy_soft_host_penalty(
-            old_proxy,
-            'blocked',
-            seconds=max(30, min(EBAY_CROSS_SOFT_PENALTY, 90)),
-        )
-        proxy_preflight_wakeup_event.set()
-        webshare_handoff_wakeup_event.set()
-        adaptive_mark_main_issue(2, 'repeated_parse_error_rotate')
-        logging.warning(
-            f"🧩 Repeated parse-error x{streak}: fixed {_proxy_log_name(old_proxy)} "
-            "soft-rotated; следующий цикл сразу использует reserve/discovery вместо "
-            "повторных 10-22-секундных ожиданий на той же непригодной выдаче"
-        )
-        return True
-    return False
-
-
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
 
@@ -10170,6 +10319,11 @@ def fetch_ebay_html_with_fixed_pair():
         elif (rss_now is not None and rss_now >= MEMORY_HIGH_MB) or memory_pressure_event.is_set():
             desired = min(2, PROBE_CONCURRENCY)
             reason = f'high-memory RSS≈{rss_now:.0f}MB' if rss_now is not None else 'memory-pressure'
+        elif rss_now is not None and rss_now >= MEMORY_PROACTIVE_TRIM_MB:
+            # Elevated but not HIGH yet: preserve fast failover while avoiding a 5-6 page
+            # native-memory burst. Healthy post-restart RSS never enters this branch.
+            desired = min(3, PROBE_CONCURRENCY)
+            reason = f'elevated-memory RSS≈{rss_now:.0f}MB'
         elif elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
             desired = PROBE_DEEP_CONCURRENCY
             reason = f'elapsed={elapsed_now:.1f}s'
@@ -10633,10 +10787,14 @@ def fetch_ebay_html_with_fixed_pair():
                         discovery_winner_event.set()
                     else:
                         # Несколько probes могут завершиться одним wait() одновременно.
-                        # В V6.6 второй success ошибочно попадал в mark_failure(..., 'success').
-                        # Теперь это корректно запомненный запасной рабочий proxy.
+                        # Второй success нужен только как reputation signal; его Session/HTML
+                        # сразу освобождаем, чтобы не держать несколько полных eBay pages.
+                        html = None
                         logging.info(f"🟢 Запомнен запасной успешный proxy {_proxy_log_name(proxy)} (same batch)")
                         close_session(session)
+                elif result == 'late_success':
+                    proxy_manager.mark_success(proxy)
+                    logging.info(f"🟢 Запомнен запасной успешный proxy {_proxy_log_name(proxy)} (late probe, body dropped)")
                 elif result == 'profile_error':
                     close_session(session)
                     fallback_profile = get_preferred_profile()
@@ -11654,28 +11812,32 @@ def _parse_main_search_soup_memory_safe(html):
     """Parse the main eBay SRP with bounded memory.
 
     Returns ``(soup, mode)`` where mode is ``root`` / ``card_only`` / ``full``.
-    V6.42 keeps the second memory-safe strategy before the expensive full DOM:
-    if the familiar SRP root is missing in an A/B response, parse only outer
-    listing-card tags (s-card / s-item / su-card-container). This is designed
-    specifically for the production case where HTTP 200 was healthy but RSS
-    around 450 MB forced us to skip 90 otherwise usable cycles.
+
+    V6.43 fixes an important BeautifulSoup ``SoupStrainer`` edge case from V6.41/42:
+    during parse_only, a ``class_='s-card'`` / exact-class regexp does NOT reliably match
+    tags that have several CSS classes (the normal eBay case).  The production symptom was
+    HTTP 200 + ~1.5 MB HTML, yet the card-only parser returned zero cards.  We now match CSS
+    tokens inside the raw class attribute with whitespace boundaries.
+
+    The 512-MB Render instance no longer attempts a full DOM near 450+ MB.  Root/card-only
+    parsing is cheap; a full DOM is allowed only below MEMORY_FULL_DOM_FALLBACK_MAX_MB.
     """
     if not html:
         return None, None
 
-    strainer = None
-    # Raw-string checks are cheap and avoid constructing a full DOM just to locate the root.
-    if re.search("id\\s*=\\s*['\"]srp-river-results['\"]", html, re.I):
-        strainer = SoupStrainer(id='srp-river-results')
-    elif re.search("class\\s*=\\s*['\"][^'\"]*\\bsrp-river-results\\b", html, re.I):
-        strainer = SoupStrainer(class_='srp-river-results')
-    elif re.search("class\\s*=\\s*['\"][^'\"]*\\bsrp-results\\b", html, re.I):
-        strainer = SoupStrainer(class_='srp-results')
+    root_class_re = re.compile(
+        r'(?:^|\s)(?:srp-river-results|srp-results)(?:\s|$)',
+        re.I,
+    )
+    card_class_re = re.compile(
+        r'(?:^|\s)(?:s-card|s-item|su-card-container)(?:\s|$)',
+        re.I,
+    )
 
-    if strainer is not None:
-        soup = BeautifulSoup(html, 'html.parser', parse_only=strainer)
-        # Do not accept an empty shell merely because the root tag itself exists.
-        # A real SRP subtree should contain at least one public /itm/ link.
+    # Prefer the canonical id because it is the least ambiguous and SoupStrainer handles
+    # id= reliably even when parent html/body tags are discarded by parse_only.
+    if re.search(r'id\s*=\s*[\"\']srp-river-results[\"\']', html, re.I):
+        soup = BeautifulSoup(html, 'html.parser', parse_only=SoupStrainer(id='srp-river-results'))
         if soup.find('a', href=re.compile(r'/itm/', re.I)) is not None:
             return soup, 'root'
         try:
@@ -11683,18 +11845,29 @@ def _parse_main_search_soup_memory_safe(html):
         except Exception:
             pass
 
-    # V6.42: A/B variants occasionally omit/rename the classic SRP root while the
-    # actual 60 listing cards still use familiar card classes. Parse ONLY those
-    # outer card tags and descendants. This is much cheaper than a full 1.5-1.8 MB
-    # DOM and remains bounded even when Render RSS is already near 450 MB.
+    # Some eBay variants expose the same results root only through classes, often with
+    # additional classes.  Token-aware regexp is required here (exact class matching was
+    # the V6.42 bug).
+    if re.search(r'class\s*=\s*[\"\'][^\"\']*(?:srp-river-results|srp-results)', html, re.I):
+        soup = BeautifulSoup(html, 'html.parser', parse_only=SoupStrainer(class_=root_class_re))
+        if soup.find('a', href=re.compile(r'/itm/', re.I)) is not None:
+            return soup, 'root'
+        try:
+            soup.decompose()
+        except Exception:
+            pass
+
+    # Memory-safe A/B fallback: parse only complete listing-card tags and descendants.
+    # IMPORTANT: match the class ATTRIBUTE as a token-containing string.  eBay normally
+    # uses e.g. class="s-card s-card--horizontal ..."; the old exact regexp matched none.
     if re.search(
-        r'class\s*=\s*["\'][^"\']*(?:\bs-card\b|\bs-item\b|\bsu-card-container\b)',
+        r'class\s*=\s*[\"\'][^\"\']*(?:\bs-card\b|\bs-item\b|\bsu-card-container\b)',
         html,
         re.I,
     ):
         card_strainer = SoupStrainer(
-            name=('li', 'div'),
-            class_=re.compile(r'^(?:s-card|s-item|su-card-container)$', re.I),
+            name=re.compile(r'^(?:li|div|article)$', re.I),
+            class_=card_class_re,
         )
         card_soup = BeautifulSoup(html, 'html.parser', parse_only=card_strainer)
         if card_soup.find('a', href=re.compile(r'/itm/', re.I)) is not None:
@@ -11704,38 +11877,131 @@ def _parse_main_search_soup_memory_safe(html):
         except Exception:
             pass
 
+    # Full DOM is a compatibility fallback only when there is genuinely ample memory.
+    # On the 512-MB Render service a 450-470 MB starting RSS is NOT safe, even if one
+    # gc/malloc_trim pass briefly frees a few MB.
     rss_now = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
-    if rss_now is not None and rss_now >= MEMORY_HIGH_MB:
-        rss_before = rss_now
-        # V6.42: production repeatedly showed that a forced trim immediately reduced
-        # 451-453 MB to ~444 MB. Do the cleanup BEFORE throwing away a valid HTTP-200
-        # page. Only then, and only below a conservative safe start threshold, allow one
-        # full-DOM rescue. This preserves the 512-MB headroom while avoiding multi-minute
-        # blind spots in new-item monitoring.
-        rss_after = _memory_maintenance('pre full-DOM parser rescue', force=True)
-        if (
-            rss_after is not None
-            and rss_after <= MEMORY_FULL_DOM_RESCUE_MAX_MB
-            and not main_discovery_active_event.is_set()
-        ):
-            logging.info(
-                f"🧩 Full-DOM parser rescue разрешён после cleanup: "
-                f"RSS {rss_before:.0f}→{rss_after:.0f} MB "
-                f"(safe_start≤{MEMORY_FULL_DOM_RESCUE_MAX_MB} MB)"
-            )
-            rss_now = rss_after
-        else:
-            after_txt = f"{rss_after:.0f}" if rss_after is not None else "?"
-            logging.warning(
-                f"🧠 Main parse full-DOM fallback suppressed: RSS {rss_before:.0f}→{after_txt} MB; "
-                f"safe_start≤{MEMORY_FULL_DOM_RESCUE_MAX_MB} MB, "
-                f"discovery={'ON' if main_discovery_active_event.is_set() else 'OFF'}; "
-                "card-only fallback тоже не дал пригодных карточек; БД не изменяем"
-            )
-            return None, None
+    if rss_now is not None and rss_now > MEMORY_FULL_DOM_FALLBACK_MAX_MB:
+        logging.warning(
+            f"🧠 Full-DOM parser skipped safely at RSS≈{rss_now:.0f} MB "
+            f"(limit≤{MEMORY_FULL_DOM_FALLBACK_MAX_MB} MB); "
+            "переходим к continuity-safe anchor fallback вместо риска OOM"
+        )
+        return None, None
 
     return BeautifulSoup(html, 'html.parser'), 'full'
 
+
+def _parse_anchor_only_fallback(html, max_items=MAX_ITEMS):
+    """Last-resort, very-low-memory SRP fallback based only on /itm/ anchors.
+
+    It is intentionally usable only after we already have a trusted top-page fingerprint.
+    We scan at most RAW_ANCHOR_SCAN_LIMIT unique item links and choose the 60-link window
+    with the greatest overlap with the previously trusted result set.  A high overlap is
+    required, so recommendation carousels cannot suddenly become dozens of "new" items.
+
+    Prices/shipping are left unknown.  For an actually new ID, the existing short
+    PriceGuard detail request still gets a chance to fill them before Telegram delivery.
+    """
+    if not RAW_ANCHOR_FALLBACK_ENABLED or not html:
+        return None
+
+    with search_continuity_lock:
+        trusted = set(search_continuity_trusted_ids)
+    if len(trusted) < SEARCH_CONTINUITY_MIN_ITEMS:
+        return None
+
+    anchor_soup = None
+    try:
+        anchor_soup = BeautifulSoup(
+            html,
+            'html.parser',
+            parse_only=SoupStrainer(name='a', href=re.compile(r'/itm/', re.I)),
+        )
+        ordered = []
+        index_by_id = {}
+        for a in anchor_soup.find_all('a', href=True):
+            raw_url = html_lib.unescape(a.get('href') or '')
+            item_id = extract_item_id(raw_url)
+            if not item_id:
+                continue
+            if raw_url.startswith('/'):
+                raw_url = 'https://www.ebay.com' + raw_url
+            title = clean_title(
+                a.get('aria-label')
+                or a.get('title')
+                or a.get_text(' ', strip=True)
+                or ''
+            )
+            if item_id in index_by_id:
+                pos = index_by_id[item_id]
+                # A card often contains image-link first and title-link second.  Upgrade
+                # the title when the later duplicate carries better human-readable text.
+                if title and len(title) > len(ordered[pos]['title']):
+                    ordered[pos]['title'] = title
+                continue
+            index_by_id[item_id] = len(ordered)
+            ordered.append({'id': item_id, 'url': raw_url, 'title': title})
+            if len(ordered) >= RAW_ANCHOR_SCAN_LIMIT:
+                break
+
+        if len(ordered) < SEARCH_CONTINUITY_MIN_ITEMS:
+            return None
+
+        window_size = min(max_items, MAX_ITEMS, 60, len(ordered))
+        if window_size < SEARCH_CONTINUITY_MIN_ITEMS:
+            return None
+
+        best = None
+        best_overlap = -1
+        # Search a bounded prefix only; this is tiny compared with DOM construction.
+        for start in range(0, len(ordered) - window_size + 1):
+            window = ordered[start:start + window_size]
+            ids = {x['id'] for x in window}
+            overlap = len(ids & trusted)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best = window
+
+        if not best:
+            return None
+        denom = float(min(len(trusted), len(best))) or 1.0
+        overlap_ratio = best_overlap / denom
+        required = max(SEARCH_CONTINUITY_MIN_OVERLAP, RAW_ANCHOR_FALLBACK_MIN_OVERLAP)
+        if overlap_ratio < required:
+            logging.warning(
+                f"🛡 Anchor-only fallback rejected: overlap={best_overlap}/{int(denom)} "
+                f"({overlap_ratio:.0%}) < {required:.0%}; БД не меняем"
+            )
+            return None
+
+        items = {}
+        for rec in best:
+            item_id = rec['id']
+            title = rec['title'] or f"eBay item {item_id}"
+            items[item_id] = {
+                'url': rec['url'],
+                'title': title,
+                'price': None,
+                'shipping': None,
+                'best_offer': False,
+                'auction': False,
+                'has_buy_it_now': False,
+                'buy_it_now_price': None,
+                '_anchor_only_fallback': True,
+            }
+        logging.warning(
+            f"🛟 Anchor-only continuity fallback: {len(items)} item(s), "
+            f"overlap={best_overlap}/{int(denom)} ({overlap_ratio:.0%}); "
+            "новые ID не будут пропущены даже при неизвестном card-layout"
+        )
+        return items
+    finally:
+        if anchor_soup is not None:
+            try:
+                anchor_soup.decompose()
+            except Exception:
+                pass
 
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
@@ -11745,13 +12011,16 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     try:
         soup, parse_mode = _parse_main_search_soup_memory_safe(html)
         if soup is None:
-            return None
+            return _parse_anchor_only_fallback(html, max_items=max_items)
         cards = _main_search_result_cards(
             soup,
             allow_rootless_cards=(parse_mode == 'card_only'),
         )
         if cards is None:
-            return None
+            # The HTTP page is real but its card wrapper changed.  Do not rotate a
+            # healthy proxy or build a huge DOM; continuity-safe link extraction is
+            # enough to keep new-item detection alive.
+            return _parse_anchor_only_fallback(html, max_items=max_items)
 
         items = {}
         for card in cards:
@@ -11856,6 +12125,9 @@ def _search_continuity_accept(current_ids):
         trusted = set(search_continuity_trusted_ids)
 
     # First main page after process start: durable DB provides a one-time sanity check.
+    # V6.44 restart resilience: a long outage can legitimately leave 50+ unseen items.
+    # Quarantine the first such page, then accept it after a second highly-overlapping
+    # observation. This preserves false-burst protection without getting stuck forever.
     if not trusted:
         if len(ids) >= SEARCH_CONTINUITY_MIN_ITEMS:
             try:
@@ -11865,13 +12137,60 @@ def _search_continuity_accept(current_ids):
                 unseen = set()
             if len(unseen) >= SEARCH_CONTINUITY_COLD_MASS_NEW:
                 adaptive_mark_main_issue(1, 'cold_mass_new_result_set')
+                now_mono = time.monotonic()
+                confirmed = False
+                confirm_count = 1
+                overlap_ratio = 0.0
+                global search_continuity_cold_candidate_ids
+                global search_continuity_cold_candidate_count
+                global search_continuity_cold_candidate_started
+                with search_continuity_lock:
+                    previous = set(search_continuity_cold_candidate_ids)
+                    age = (
+                        now_mono - search_continuity_cold_candidate_started
+                        if search_continuity_cold_candidate_started
+                        else 1e9
+                    )
+                    if previous and age <= SEARCH_CONTINUITY_COLD_CONFIRM_WINDOW:
+                        denom = float(min(len(previous), len(ids))) or 1.0
+                        overlap_ratio = len(previous & ids) / denom
+                        if overlap_ratio >= SEARCH_CONTINUITY_COLD_CONFIRM_OVERLAP:
+                            search_continuity_cold_candidate_count += 1
+                        else:
+                            search_continuity_cold_candidate_count = 1
+                            search_continuity_cold_candidate_started = now_mono
+                    else:
+                        search_continuity_cold_candidate_count = 1
+                        search_continuity_cold_candidate_started = now_mono
+
+                    search_continuity_cold_candidate_ids = set(ids)
+                    confirm_count = search_continuity_cold_candidate_count
+                    if confirm_count >= SEARCH_CONTINUITY_COLD_CONFIRMATIONS:
+                        search_continuity_trusted_ids = set(ids)
+                        search_continuity_cold_candidate_ids.clear()
+                        search_continuity_cold_candidate_count = 0
+                        search_continuity_cold_candidate_started = 0.0
+                        confirmed = True
+
+                if confirmed:
+                    logging.warning(
+                        f"✅ Search continuity cold-start CONFIRMED after restart: "
+                        f"{len(unseen)}/{len(ids)} IDs unseen, repeat overlap={overlap_ratio:.0%}; "
+                        "принимаем новую top-60 и продолжаем уведомления"
+                    )
+                    return True
+
                 logging.warning(
                     f"🛡 Search continuity HOLD: cold page has {len(unseen)}/{len(ids)} unseen IDs; "
-                    "seen_items НЕ меняем и Telegram НЕ рассылаем до нормальной выдачи"
+                    f"confirmation={confirm_count}/{SEARCH_CONTINUITY_COLD_CONFIRMATIONS}. "
+                    "Нужна ещё одна совпадающая выдача; seen_items пока НЕ меняем."
                 )
                 return False
         with search_continuity_lock:
             search_continuity_trusted_ids = set(ids)
+            search_continuity_cold_candidate_ids.clear()
+            search_continuity_cold_candidate_count = 0
+            search_continuity_cold_candidate_started = 0.0
         return True
 
     if len(ids) >= SEARCH_CONTINUITY_MIN_ITEMS and len(trusted) >= SEARCH_CONTINUITY_MIN_ITEMS:
@@ -12159,6 +12478,11 @@ def proxy_preflight_warm_worker():
                     if quality_before < PROXY_PREFLIGHT_RESERVE_TARGET
                     else PROXY_PREFLIGHT_MAINTENANCE_BATCH
                 )
+                warm_rss = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+                # Between proactive-trim and HIGH pressure keep some reserve freshness, but
+                # halve background TLS work. At healthy RSS this is exactly the old speed.
+                if warm_rss is not None and warm_rss >= MEMORY_PROACTIVE_TRIM_MB:
+                    batch_limit = max(1, min(batch_limit, max(2, PROXY_PREFLIGHT_MAINTENANCE_BATCH)))
                 candidates = proxy_manager.get_quality_preflight_candidates(
                     batch_limit,
                     excluded_hosts=excluded,
@@ -12168,8 +12492,11 @@ def proxy_preflight_warm_worker():
                 ok_count = 0
                 reason_counts = {}
                 if candidates:
+                    warm_workers = min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates))
+                    if warm_rss is not None and warm_rss >= MEMORY_PROACTIVE_TRIM_MB:
+                        warm_workers = min(warm_workers, 2)
                     with ThreadPoolExecutor(
-                        max_workers=min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates)),
+                        max_workers=max(1, warm_workers),
                         thread_name_prefix='proxy-quality-preflight',
                     ) as executor:
                         future_map = {
@@ -12204,8 +12531,12 @@ def proxy_preflight_warm_worker():
                     excluded_hosts=excluded,
                 )
                 if candidates:
+                    warm_rss = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+                    warm_workers = min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates))
+                    if warm_rss is not None and warm_rss >= MEMORY_PROACTIVE_TRIM_MB:
+                        warm_workers = min(warm_workers, 2)
                     with ThreadPoolExecutor(
-                        max_workers=min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates)),
+                        max_workers=max(1, warm_workers),
                         thread_name_prefix='proxy-preflight',
                     ) as executor:
                         futures = [executor.submit(_tcp_preflight_proxy, p, True) for p in candidates]
@@ -12256,7 +12587,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.42 PARSE-RECOVERY-FAST-PROXY работает." +
+        "\n🇺🇸 eBay США monitor v6.44 MEMORY-FUSE-PARSER работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -12299,27 +12630,17 @@ def bot_worker():
                         parse_error_proxy_key = current_proxy_key
                         parse_error_streak = 1
 
-                    rotated = False
-                    if parse_error_streak >= PARSE_ERROR_ROTATE_AFTER:
-                        rotated = _rotate_fixed_after_repeated_parse_error(parse_error_streak)
-                        if rotated:
-                            parse_error_proxy_key = None
-                            parse_error_streak = 0
-
-                    # A parse miss means HTTP 200 already arrived. Waiting a full stressed
-                    # 10-22s created 2-3 minute blind spots in production. First miss gets
-                    # a short same-proxy retry; second consecutive miss soft-rotates and
-                    # gives reserve/discovery the next cycle almost immediately.
+                    # V6.43: parser failure is not proxy failure.  V6.42 rotated every
+                    # second healthy HTTP-200 response, creating discovery storms, extra
+                    # 1.5-1.8 MB responses and finally an OOM.  Keep the fixed proxy and
+                    # retry shortly; the HTTP layer will rotate it immediately if it
+                    # actually becomes 403/429/challenge/transport-failed.
                     wait = random.uniform(PARSE_ERROR_FAST_RETRY_MIN, PARSE_ERROR_FAST_RETRY_MAX)
-                    if rotated:
-                        wait = min(wait, 1.5)
-
                     logging.warning(
                         f"⚠️ eBay доступен, но разметка не распознана. Цикл {cycle_elapsed:.1f} сек.; "
-                        f"parse_streak={parse_error_streak if not rotated else 0}, "
-                        f"adaptive={cadence_mode} ({cadence_low:.0f}-{cadence_high:.0f} сек.), "
-                        f"быстрый повтор через {wait:.1f} сек."
-                        + (" Fixed proxy soft-rotated." if rotated else "")
+                        f"parse_streak={parse_error_streak}, adaptive={cadence_mode} "
+                        f"({cadence_low:.0f}-{cadence_high:.0f} сек.), "
+                        f"повтор через {wait:.1f} сек. БЕЗ смены исправного HTTP-200 proxy."
                     )
                 else:
                     parse_error_proxy_key = None
@@ -12347,6 +12668,10 @@ def bot_worker():
                     logging.info(
                         f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд."
                     )
+            # Main-cycle local HTML/DOM objects are already out of scope here. If RSS
+            # nevertheless drifted upward, reclaim arenas before the sleep instead of
+            # letting several generations accumulate until the next failover.
+            _proactive_memory_housekeeping('after main cycle')
             time.sleep(wait)
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
             # eBay/proxy may be perfectly healthy. A transient DB outage must not mark or
@@ -12379,7 +12704,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.42 PARSE-RECOVERY-FAST-PROXY: "
+        "🌐 Multi-provider v6.44 MEMORY-FUSE-PARSER: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"order=FREE→Premium base@{PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS}attempts"
@@ -12396,10 +12721,13 @@ def start_leader_workers():
     rss = _memory_rss_mb()
     logging.info(
         f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/high/clear/emergency/auction-pause="
-        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB; detail-skip={MEMORY_DETAIL_SKIP_MB} MB; fullDOM-safe-start={MEMORY_FULL_DOM_RESCUE_MAX_MB} MB; "
+        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB; "
+        f"proactive/session/panic={MEMORY_PROACTIVE_TRIM_MB}/{MEMORY_SESSION_RECYCLE_MB}/{MEMORY_PANIC_MB} MB; "
+        f"detail-skip={MEMORY_DETAIL_SKIP_MB} MB; fullDOM-max-start={MEMORY_FULL_DOM_FALLBACK_MAX_MB} MB; "
         f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}" if rss is not None else
         f"🧠 MemorySafe enabled: soft/high/clear/emergency/auction-pause="
-        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB"
+        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB; "
+        f"proactive/session/panic={MEMORY_PROACTIVE_TRIM_MB}/{MEMORY_SESSION_RECYCLE_MB}/{MEMORY_PANIC_MB} MB"
     )
     logging.info(
         f"🛡 Search continuity: ON={SEARCH_CONTINUITY_GUARD_ENABLED}, "
@@ -12410,6 +12738,11 @@ def start_leader_workers():
         f"🧩 Search soft-shell guard: max_bytes={SEARCH_SOFT_SHELL_MAX_BYTES}, "
         f"max_itm_links={SEARCH_SOFT_SHELL_MAX_ITM_LINKS}, "
         f"immediate_retry={SEARCH_SOFT_SHELL_IMMEDIATE_RETRY}"
+    )
+    logging.info(
+        f"🧩 ParserSafe v6.44: token-aware root/card SoupStrainer + anchor-continuity fallback; "
+        f"full-DOM only at RSS≤{MEMORY_FULL_DOM_FALLBACK_MAX_MB} MB; "
+        f"parse-error proxy rotation=OFF"
     )
     if CHECK_INTERVAL > 10:
         logging.info(
@@ -12465,7 +12798,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.42 ParseRecoveryFastProxy, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.44 MemoryFuseParser, {role})"
 
 
 @app.route('/health')
