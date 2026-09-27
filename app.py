@@ -400,7 +400,11 @@ MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 10, int(os.getenv("MEMORY_HIGH_MB", "450")
 MEMORY_EMERGENCY_MB = max(MEMORY_HIGH_MB + 10, min(int(os.getenv("MEMORY_EMERGENCY_MB", "480")), 495))
 MEMORY_CLEAR_MB = min(
     MEMORY_HIGH_MB - 4,
-    max(MEMORY_SOFT_MB, int(os.getenv("MEMORY_CLEAR_MB", "438"))),
+    max(
+        MEMORY_HIGH_MB - 6,
+        MEMORY_SOFT_MB,
+        int(os.getenv("MEMORY_CLEAR_MB", "446")),
+    ),
 )
 # New-item detail parsing is optional; skip it near the ceiling and send the already
 # sanitized search-card values immediately rather than risking OOM or notification delay.
@@ -415,6 +419,25 @@ MEMORY_AUCTION_PAUSE_MB = min(
     MEMORY_EMERGENCY_MB - 2,
     max(MEMORY_HIGH_MB + 10, int(os.getenv("MEMORY_AUCTION_PAUSE_MB", "476"))),
 )
+
+# V6.42: before abandoning a healthy HTTP-200 search page merely because RSS crossed
+# MEMORY_HIGH_MB, force GC+malloc_trim and allow ONE full-DOM rescue only if memory
+# falls back to a safe starting level. Production logs repeatedly showed 451-453 -> 444 MB
+# after trim, so skipping those pages cost minutes of monitoring for no real OOM benefit.
+MEMORY_FULL_DOM_RESCUE_MAX_MB = min(
+    MEMORY_HIGH_MB - 2,
+    max(MEMORY_SOFT_MB + 5, int(os.getenv("MEMORY_FULL_DOM_RESCUE_MAX_MB", "446"))),
+)
+
+# Repeated HTTP-200 parse errors on the SAME fixed proxy are strongly correlated in the
+# production log with that IP soon turning 403. First failure gets a fast retry; the
+# second consecutive one soft-rotates the fixed proxy instead of sleeping 10-22 seconds.
+PARSE_ERROR_FAST_RETRY_MIN = max(1.0, min(float(os.getenv("PARSE_ERROR_FAST_RETRY_MIN", "2.0")), 5.0))
+PARSE_ERROR_FAST_RETRY_MAX = max(
+    PARSE_ERROR_FAST_RETRY_MIN,
+    min(float(os.getenv("PARSE_ERROR_FAST_RETRY_MAX", "3.0")), 6.0),
+)
+PARSE_ERROR_ROTATE_AFTER = max(2, min(int(os.getenv("PARSE_ERROR_ROTATE_AFTER", "2")), 4))
 PROXY_REPUTATION_TTL = max(1800, int(os.getenv("PROXY_REPUTATION_TTL", "21600")))
 PROXY_REPUTATION_MAX = max(1000, int(os.getenv("PROXY_REPUTATION_MAX", "7000")))
 PROVIDER_UNIQUE_STATS_CAP = max(500, int(os.getenv("PROVIDER_UNIQUE_STATS_CAP", "4096")))
@@ -9353,11 +9376,18 @@ def _quality_https_preflight_proxy(proxy):
                 pass
 
 
-def _probe_proxy(proxy, profile, timeout):
-    """Одна discovery-проверка: быстрый TCP preflight -> только затем eBay."""
+def _probe_proxy(proxy, profile, timeout, stop_event=None):
+    """Одна discovery-проверка: быстрый TCP preflight -> только затем eBay.
+
+    V6.41: если другой proxy уже победил, probe, который ещё находился только
+    на дешёвом TCP-preflight, не начинает лишний полноценный eBay HTTP request.
+    Уже начавшийся curl-request не прерываем — это безопаснее для curl_cffi.
+    """
     ok, preflight_result = _tcp_preflight_proxy(proxy, force=False)
     if not ok:
         return preflight_result or 'proxy_error', None, None
+    if stop_event is not None and stop_event.is_set():
+        return 'cancelled', None, None
     return _make_request(
         proxy,
         profile,
@@ -9381,7 +9411,9 @@ def _cleanup_late_probe_future(future, proxy):
         if result == 'success':
             proxy_manager.mark_success(proxy)
             logging.info(f"🟢 Запомнен запасной успешный proxy {_proxy_log_name(proxy)} (late probe)")
-        elif result != 'profile_error':
+        elif result in ('cancelled', 'profile_error'):
+            pass
+        else:
             proxy_manager.mark_failure(proxy, result, reason=f'{result} (late probe)')
             _auction_proxy_soft_host_penalty(proxy, result)
     finally:
@@ -9791,6 +9823,56 @@ def _quarantine_fixed_after_soft_search_shell(html):
     return False
 
 
+def _rotate_fixed_after_repeated_parse_error(streak):
+    """Soft-rotate a fixed proxy after repeated HTTP-200 but unusable search DOM.
+
+    One parse miss can be an eBay A/B/transient response and is retried quickly.
+    Two consecutive misses on the same fixed IP are different: production logs show
+    long runs of unusable 200 pages followed by 403. Rotating at that point removes
+    multi-minute blind spots without treating the IP as a hard block.
+    """
+    global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
+
+    old_proxy = None
+    old_session = None
+    acquired = main_fixed_request_lock.acquire(timeout=0.75)
+    try:
+        if not acquired or fixed_proxy is None:
+            return False
+        old_proxy = fixed_proxy
+        old_session = fixed_session
+        fixed_proxy = None
+        fixed_profile = None
+        fixed_session = None
+        fixed_pair_since_monotonic = None
+    finally:
+        if acquired:
+            main_fixed_request_lock.release()
+
+    close_session(old_session)
+    if old_proxy:
+        proxy_manager.mark_failure(
+            old_proxy,
+            'soft_blocked',
+            reason=f'repeated HTTP-200 unparseable search DOM x{streak}',
+        )
+        _auction_proxy_soft_host_penalty(
+            old_proxy,
+            'blocked',
+            seconds=max(30, min(EBAY_CROSS_SOFT_PENALTY, 90)),
+        )
+        proxy_preflight_wakeup_event.set()
+        webshare_handoff_wakeup_event.set()
+        adaptive_mark_main_issue(2, 'repeated_parse_error_rotate')
+        logging.warning(
+            f"🧩 Repeated parse-error x{streak}: fixed {_proxy_log_name(old_proxy)} "
+            "soft-rotated; следующий цикл сразу использует reserve/discovery вместо "
+            "повторных 10-22-секундных ожиданий на той же непригодной выдаче"
+        )
+        return True
+    return False
+
+
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
 
@@ -9802,6 +9884,7 @@ def fetch_ebay_html_with_fixed_pair():
     # Свежий background-резерв используется ПЕРВЫМ после падения fixed proxy.
     # На холодном старте список пуст: обычный discovery работает как раньше.
     fast_standby_queue = []
+    quality_ready = 0
 
     # 1) Максимально долго держим реально рабочую session.
     if fixed_proxy is not None and fixed_profile is not None:
@@ -9918,11 +10001,11 @@ def fetch_ebay_html_with_fixed_pair():
             [p for p in fast_standby_queue if _proxy_scheme(p) in ('http', 'https')]
             + [p for p in fast_standby_queue if _proxy_scheme(p) == 'socks5']
         )
+        quality_ready = sum(
+            1 for p in fast_standby_queue
+            if proxy_manager.quality_state(p) == 'ok'
+        )
         if fast_standby_queue:
-            quality_ready = sum(
-                1 for p in fast_standby_queue
-                if proxy_manager.quality_state(p) == 'ok'
-            )
             logging.info(
                 f"⚡ Готов warm reserve: {len(fast_standby_queue)} proxy "
                 f"(HTTPS/TLS-ready={quality_ready}); пробуем его раньше fresh discovery"
@@ -10016,6 +10099,32 @@ def fetch_ebay_html_with_fixed_pair():
                 "сразу запускаем обычный discovery"
             )
 
+    # V6.42: tiered Premium assist. Production showed that a *single* HTTPS-ready
+    # FREE reserve endpoint often failed and then the old policy still burned 5-6 slow
+    # FREE probes before Premium joined. FREE keeps first priority, but a weak reserve
+    # now unlocks Premium much sooner. A healthy reserve (3+ quality endpoints) keeps
+    # the conservative original timing. Webshare remains untouched at ~30s reserve.
+    standby_count = len(fast_standby_queue)
+    if quality_ready <= 1 or standby_count <= 1:
+        premium_assist_tier = 'fast'
+        local_premium_unlock_after = min(PREMIUM_UNLOCK_AFTER, 1.8)
+        local_premium_unlock_attempts = min(PREMIUM_UNLOCK_ATTEMPTS, 2)
+    elif quality_ready == 2 or standby_count <= 3:
+        premium_assist_tier = 'medium'
+        local_premium_unlock_after = min(PREMIUM_UNLOCK_AFTER, 3.0)
+        local_premium_unlock_attempts = min(PREMIUM_UNLOCK_ATTEMPTS, 3)
+    else:
+        premium_assist_tier = 'normal'
+        local_premium_unlock_after = PREMIUM_UNLOCK_AFTER
+        local_premium_unlock_attempts = PREMIUM_UNLOCK_ATTEMPTS
+
+    if premium_assist_tier != 'normal':
+        logging.info(
+            f"⚡ Fast Premium assist[{premium_assist_tier}]: warm reserve="
+            f"{standby_count}, HTTPS-ready={quality_ready}; FREE first, Premium unlock≈"
+            f"{local_premium_unlock_after:.1f}s/{local_premium_unlock_attempts} attempts"
+        )
+
     started = time.monotonic()
     tried_hosts = set()
     tried_proxies = set()
@@ -10042,6 +10151,7 @@ def fetch_ebay_html_with_fixed_pair():
         thread_name_prefix='proxy-probe',
     )
     main_discovery_active_event.set()
+    discovery_winner_event = threading.Event()
     future_to_proxy = {}
     last_concurrency_logged = None
 
@@ -10186,8 +10296,8 @@ def fetch_ebay_html_with_fixed_pair():
         if need > 0:
             elapsed_provider = time.monotonic() - started
             premium_unlocked = (
-                elapsed_provider >= PREMIUM_UNLOCK_AFTER
-                or attempts >= PREMIUM_UNLOCK_ATTEMPTS
+                elapsed_provider >= local_premium_unlock_after
+                or attempts >= local_premium_unlock_attempts
             )
             webshare_unlocked = elapsed_provider >= WEBSHARE_RESERVE_DELAY
 
@@ -10334,8 +10444,8 @@ def fetch_ebay_html_with_fixed_pair():
                 maybe_load_emergency(force=True)
                 elapsed_provider = time.monotonic() - started
                 premium_unlocked = (
-                    elapsed_provider >= PREMIUM_UNLOCK_AFTER
-                    or attempts >= PREMIUM_UNLOCK_ATTEMPTS
+                    elapsed_provider >= local_premium_unlock_after
+                    or attempts >= local_premium_unlock_attempts
                 )
                 batch = proxy_manager.get_candidate_batch(
                     min(free_slots, MAX_SEARCH_ATTEMPTS - attempts),
@@ -10352,8 +10462,8 @@ def fetch_ebay_html_with_fixed_pair():
                 refreshed_after_exhaustion = True
                 elapsed_provider = time.monotonic() - started
                 premium_unlocked = (
-                    elapsed_provider >= PREMIUM_UNLOCK_AFTER
-                    or attempts >= PREMIUM_UNLOCK_ATTEMPTS
+                    elapsed_provider >= local_premium_unlock_after
+                    or attempts >= local_premium_unlock_attempts
                 )
                 batch = proxy_manager.get_candidate_batch(
                     min(free_slots, MAX_SEARCH_ATTEMPTS - attempts),
@@ -10443,6 +10553,7 @@ def fetch_ebay_html_with_fixed_pair():
                 proxy,
                 profile,
                 (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+                discovery_winner_event,
             )
             future_to_proxy[future] = proxy
         return bool(batch)
@@ -10519,6 +10630,7 @@ def fetch_ebay_html_with_fixed_pair():
                     proxy_manager.mark_success(proxy)
                     if winner is None:
                         winner = (proxy, html, session)
+                        discovery_winner_event.set()
                     else:
                         # Несколько probes могут завершиться одним wait() одновременно.
                         # В V6.6 второй success ошибочно попадал в mark_failure(..., 'success').
@@ -10530,6 +10642,8 @@ def fetch_ebay_html_with_fixed_pair():
                     fallback_profile = get_preferred_profile()
                     if fallback_profile is not None:
                         profile = fallback_profile
+                elif result == 'cancelled':
+                    close_session(session)
                 else:
                     close_session(session)
                     proxy_manager.mark_failure(proxy, result, reason=result)
@@ -11383,7 +11497,7 @@ def extract_buy_it_now_info(card):
                 return True, amount
     return True, None
 
-def _main_search_result_cards(soup):
+def _main_search_result_cards(soup, allow_rootless_cards=False):
     """Возвращает только карточки ОСНОВНОЙ поисковой выдачи eBay.
 
     eBay сейчас A/B-тестирует несколько DOM-разметок. На разных proxy один и тот же
@@ -11399,7 +11513,14 @@ def _main_search_result_cards(soup):
         or soup.select_one('.srp-river-results')
         or soup.select_one('ul.srp-results')
     )
-    if root is None:
+    rootless_card_mode = False
+    if root is None and allow_rootless_cards:
+        # V6.42 memory-safe fallback: soup был заранее отфильтрован SoupStrainer-ом
+        # и содержит только card-like li/div узлы с их потомками. Поэтому здесь
+        # безопасно использовать его как ограниченный root, не сканируя всю страницу.
+        root = soup
+        rootless_card_mode = True
+    elif root is None:
         logging.warning(
             "⚠️ Основной контейнер поисковой выдачи eBay не найден; "
             "глобальный fallback по всем /itm/ ссылкам отключён"
@@ -11506,7 +11627,10 @@ def _main_search_result_cards(soup):
 
     active_layouts = ', '.join(f'{k}={v}' for k, v in layout_counts.items() if v)
     if active_layouts:
-        logging.info(f"🧩 Разметка eBay: {active_layouts}; карточек-кандидатов {len(cards)}")
+        mode_note = " (memory-safe card-only fallback)" if rootless_card_mode else ""
+        logging.info(
+            f"🧩 Разметка eBay{mode_note}: {active_layouts}; карточек-кандидатов {len(cards)}"
+        )
 
     return cards
 
@@ -11527,14 +11651,18 @@ def _listing_link(card):
 
 
 def _parse_main_search_soup_memory_safe(html):
-    """Parse only the trusted eBay SRP results subtree when possible.
+    """Parse the main eBay SRP with bounded memory.
 
-    A full BeautifulSoup tree for ~1.5 MB eBay HTML can transiently allocate tens of MB.
-    On a 512 MB Render instance this was enough to cross the hard limit while background
-    proxy responses were alive. SoupStrainer keeps descendants of the result root only.
+    Returns ``(soup, mode)`` where mode is ``root`` / ``card_only`` / ``full``.
+    V6.42 keeps the second memory-safe strategy before the expensive full DOM:
+    if the familiar SRP root is missing in an A/B response, parse only outer
+    listing-card tags (s-card / s-item / su-card-container). This is designed
+    specifically for the production case where HTTP 200 was healthy but RSS
+    around 450 MB forced us to skip 90 otherwise usable cycles.
     """
     if not html:
-        return None
+        return None, None
+
     strainer = None
     # Raw-string checks are cheap and avoid constructing a full DOM just to locate the root.
     if re.search("id\\s*=\\s*['\"]srp-river-results['\"]", html, re.I):
@@ -11546,34 +11674,82 @@ def _parse_main_search_soup_memory_safe(html):
 
     if strainer is not None:
         soup = BeautifulSoup(html, 'html.parser', parse_only=strainer)
-        # If eBay emitted a malformed/empty root, do not immediately build a second full DOM
-        # under high pressure. At low memory we retain compatibility with future layouts.
-        if soup.find(True) is not None:
-            return soup
+        # Do not accept an empty shell merely because the root tag itself exists.
+        # A real SRP subtree should contain at least one public /itm/ link.
+        if soup.find('a', href=re.compile(r'/itm/', re.I)) is not None:
+            return soup, 'root'
         try:
             soup.decompose()
         except Exception:
             pass
 
+    # V6.42: A/B variants occasionally omit/rename the classic SRP root while the
+    # actual 60 listing cards still use familiar card classes. Parse ONLY those
+    # outer card tags and descendants. This is much cheaper than a full 1.5-1.8 MB
+    # DOM and remains bounded even when Render RSS is already near 450 MB.
+    if re.search(
+        r'class\s*=\s*["\'][^"\']*(?:\bs-card\b|\bs-item\b|\bsu-card-container\b)',
+        html,
+        re.I,
+    ):
+        card_strainer = SoupStrainer(
+            name=('li', 'div'),
+            class_=re.compile(r'^(?:s-card|s-item|su-card-container)$', re.I),
+        )
+        card_soup = BeautifulSoup(html, 'html.parser', parse_only=card_strainer)
+        if card_soup.find('a', href=re.compile(r'/itm/', re.I)) is not None:
+            return card_soup, 'card_only'
+        try:
+            card_soup.decompose()
+        except Exception:
+            pass
+
     rss_now = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
     if rss_now is not None and rss_now >= MEMORY_HIGH_MB:
-        logging.warning(
-            f"🧠 Main parse full-DOM fallback suppressed at RSS≈{rss_now:.0f} MB; "
-            "БД не изменяем, повторим на следующем цикле"
-        )
-        return None
-    return BeautifulSoup(html, 'html.parser')
+        rss_before = rss_now
+        # V6.42: production repeatedly showed that a forced trim immediately reduced
+        # 451-453 MB to ~444 MB. Do the cleanup BEFORE throwing away a valid HTTP-200
+        # page. Only then, and only below a conservative safe start threshold, allow one
+        # full-DOM rescue. This preserves the 512-MB headroom while avoiding multi-minute
+        # blind spots in new-item monitoring.
+        rss_after = _memory_maintenance('pre full-DOM parser rescue', force=True)
+        if (
+            rss_after is not None
+            and rss_after <= MEMORY_FULL_DOM_RESCUE_MAX_MB
+            and not main_discovery_active_event.is_set()
+        ):
+            logging.info(
+                f"🧩 Full-DOM parser rescue разрешён после cleanup: "
+                f"RSS {rss_before:.0f}→{rss_after:.0f} MB "
+                f"(safe_start≤{MEMORY_FULL_DOM_RESCUE_MAX_MB} MB)"
+            )
+            rss_now = rss_after
+        else:
+            after_txt = f"{rss_after:.0f}" if rss_after is not None else "?"
+            logging.warning(
+                f"🧠 Main parse full-DOM fallback suppressed: RSS {rss_before:.0f}→{after_txt} MB; "
+                f"safe_start≤{MEMORY_FULL_DOM_RESCUE_MAX_MB} MB, "
+                f"discovery={'ON' if main_discovery_active_event.is_set() else 'OFF'}; "
+                "card-only fallback тоже не дал пригодных карточек; БД не изменяем"
+            )
+            return None, None
+
+    return BeautifulSoup(html, 'html.parser'), 'full'
 
 
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return None
     soup = None
+    parse_mode = None
     try:
-        soup = _parse_main_search_soup_memory_safe(html)
+        soup, parse_mode = _parse_main_search_soup_memory_safe(html)
         if soup is None:
             return None
-        cards = _main_search_result_cards(soup)
+        cards = _main_search_result_cards(
+            soup,
+            allow_rootless_cards=(parse_mode == 'card_only'),
+        )
         if cards is None:
             return None
 
@@ -11635,7 +11811,21 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
                 'buy_it_now_price': bin_price,
             }
 
-        logging.info(f"Обработано товаров основной выдачи: {len(items)}")
+        # Rootless card-only mode is intentionally strict. Recommendation carousels
+        # can also contain s-card-like nodes, but they are normally far smaller than
+        # the real top-60 result set. Refuse a tiny global fragment before touching DB;
+        # continuity guard performs an additional overlap check afterwards.
+        if parse_mode == 'card_only' and len(items) < SEARCH_CONTINUITY_MIN_ITEMS:
+            logging.warning(
+                f"🛡 Card-only fallback распознал только {len(items)} item(s) "
+                f"(<{SEARCH_CONTINUITY_MIN_ITEMS}); считаем страницу неоднозначной, БД не меняем"
+            )
+            return None
+
+        logging.info(
+            f"Обработано товаров основной выдачи: {len(items)}"
+            + (" [card-only fallback]" if parse_mode == 'card_only' else "")
+        )
         return items
     finally:
         # BeautifulSoup creates a large cyclic object graph from a ~1.6 MB eBay page.
@@ -12066,13 +12256,16 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.40 CURRENCY-HARDENED работает." +
+        "\n🇺🇸 eBay США monitor v6.42 PARSE-RECOVERY-FAST-PROXY работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
         "\nКнопка «📋 Аукционы» открывает тот же список, что и /auctions.",
         reply_markup=bot_main_reply_keyboard(),
     )
+    parse_error_proxy_key = None
+    parse_error_streak = 0
+
     while True:
         if is_paused:
             time.sleep(2)
@@ -12085,6 +12278,8 @@ def bot_worker():
             cadence_mode, cadence_reasons = adaptive_finish_main_cycle(result)
 
             if result == 'ok':
+                parse_error_proxy_key = None
+                parse_error_streak = 0
                 # V6.36: cadence считается от НАЧАЛА цикла и верхняя граница зависит
                 # только от здоровья MAIN monitor: stable 10-14, cautious 10-18, stressed 10-22.
                 cadence_mode, target_cadence, cadence_low, cadence_high = adaptive_pick_target_cadence()
@@ -12095,23 +12290,49 @@ def bot_worker():
                     f"target={target_cadence:.1f}; следующая через {wait:.1f} сек."
                 )
             elif result in ('parse_error', 'continuity_hold'):
-                # HTTP 200 был доступен. DOM-error или continuity quarantine не требуют
-                # proxy rotation; просто повторяем основной search в cautious cadence.
                 cadence_mode, target_cadence, cadence_low, cadence_high = adaptive_pick_target_cadence()
-                wait = max(MAIN_CYCLE_MIN_SLEEP, target_cadence - cycle_elapsed)
                 if result == 'parse_error':
+                    current_proxy_key = str(fixed_proxy or '')
+                    if current_proxy_key and current_proxy_key == parse_error_proxy_key:
+                        parse_error_streak += 1
+                    else:
+                        parse_error_proxy_key = current_proxy_key
+                        parse_error_streak = 1
+
+                    rotated = False
+                    if parse_error_streak >= PARSE_ERROR_ROTATE_AFTER:
+                        rotated = _rotate_fixed_after_repeated_parse_error(parse_error_streak)
+                        if rotated:
+                            parse_error_proxy_key = None
+                            parse_error_streak = 0
+
+                    # A parse miss means HTTP 200 already arrived. Waiting a full stressed
+                    # 10-22s created 2-3 minute blind spots in production. First miss gets
+                    # a short same-proxy retry; second consecutive miss soft-rotates and
+                    # gives reserve/discovery the next cycle almost immediately.
+                    wait = random.uniform(PARSE_ERROR_FAST_RETRY_MIN, PARSE_ERROR_FAST_RETRY_MAX)
+                    if rotated:
+                        wait = min(wait, 1.5)
+
                     logging.warning(
                         f"⚠️ eBay доступен, но разметка не распознана. Цикл {cycle_elapsed:.1f} сек.; "
+                        f"parse_streak={parse_error_streak if not rotated else 0}, "
                         f"adaptive={cadence_mode} ({cadence_low:.0f}-{cadence_high:.0f} сек.), "
-                        f"повтор через {wait:.1f} сек. без смены proxy."
+                        f"быстрый повтор через {wait:.1f} сек."
+                        + (" Fixed proxy soft-rotated." if rotated else "")
                     )
                 else:
+                    parse_error_proxy_key = None
+                    parse_error_streak = 0
+                    wait = max(MAIN_CYCLE_MIN_SLEEP, target_cadence - cycle_elapsed)
                     logging.warning(
                         f"🛡 Альтернативная выдача eBay временно удержана. Цикл {cycle_elapsed:.1f} сек.; "
                         f"adaptive={cadence_mode} ({cadence_low:.0f}-{cadence_high:.0f} сек.), "
                         f"повтор через {wait:.1f} сек.; новые ID пока НЕ записаны."
                     )
             else:
+                parse_error_proxy_key = None
+                parse_error_streak = 0
                 # Реальная проблема загрузки/proxy: discovery уже сам потратил время.
                 # Оставляем прежний короткий 3-5s retry, чтобы не устроить busy-loop.
                 wait = random.uniform(FAILED_SEARCH_RETRY_MIN, FAILED_SEARCH_RETRY_MAX)
@@ -12158,10 +12379,11 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.40 CURRENCY-HARDENED: "
+        "🌐 Multi-provider v6.42 PARSE-RECOVERY-FAST-PROXY: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
-        f"order=FREE→Premium@{PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS}attempts"
+        f"order=FREE→Premium base@{PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS}attempts"
+        f" (fast-assist 2.5s/2 attempts when warm HTTPS reserve is empty)"
         f"→Webshare@{WEBSHARE_RESERVE_DELAY:.0f}s, "
         f"cadence=adaptive {CHECK_INTERVAL}-{CHECK_INTERVAL + ADAPTIVE_STABLE_JITTER:.0f}/"
         f"{CHECK_INTERVAL}-{CHECK_INTERVAL + ADAPTIVE_CAUTION_JITTER:.0f}/"
@@ -12174,7 +12396,7 @@ def start_leader_workers():
     rss = _memory_rss_mb()
     logging.info(
         f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/high/clear/emergency/auction-pause="
-        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB; detail-skip={MEMORY_DETAIL_SKIP_MB} MB; "
+        f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB; detail-skip={MEMORY_DETAIL_SKIP_MB} MB; fullDOM-safe-start={MEMORY_FULL_DOM_RESCUE_MAX_MB} MB; "
         f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}" if rss is not None else
         f"🧠 MemorySafe enabled: soft/high/clear/emergency/auction-pause="
         f"{MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_CLEAR_MB}/{MEMORY_EMERGENCY_MB}/{MEMORY_AUCTION_PAUSE_MB} MB"
@@ -12243,7 +12465,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.40 CurrencyHardened, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.42 ParseRecoveryFastProxy, {role})"
 
 
 @app.route('/health')
