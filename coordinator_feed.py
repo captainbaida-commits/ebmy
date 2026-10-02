@@ -181,7 +181,15 @@ class CoordinatorFeed:
             key = self.ids.get(proxy)
             if key is None:
                 return
-            self.pending[key] = {'proxy_key': key, 'result': mapped}
+            previous = self.pending.get(key, ())
+            latest = {'proxy_key': key, 'result': mapped}
+            # Preserve a real success preceding the latest failure in this interval.
+            # Repeated successes are coalesced; the final negative result still wins
+            # server-side and cannot make a blocked endpoint eligible again.
+            if mapped != 'success' and previous and previous[0]['result'] == 'success':
+                self.pending[key] = (previous[0], latest)
+            else:
+                self.pending[key] = (latest,)
             self.pending.move_to_end(key)
             while len(self.pending) > 128:
                 self.pending.popitem(last=False)
@@ -192,8 +200,14 @@ class CoordinatorFeed:
             if not self.pending or now - self.last_feedback < 30:
                 return
             self.last_feedback = now
-            reports = [self.pending.popitem(last=False)[1]
-                       for _ in range(min(64, len(self.pending)))]
+            reports = []
+            # Keep each endpoint's success/failure pair together and in order.
+            while self.pending:
+                events = next(iter(self.pending.values()))
+                if len(reports) + len(events) > 64:
+                    break
+                self.pending.popitem(last=False)
+                reports.extend(events)
         response = None
         try:
             deadline = time.monotonic() + 3.0
