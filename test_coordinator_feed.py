@@ -142,9 +142,45 @@ def test_feedback_queues_real_results_without_network_and_flushes(feed):
     assert len(client.pending) == 1
     client.flush_feedback()
     sent = transport.post.call_args.kwargs['json']
-    assert sent == dict(market='us', reports=[dict(proxy_key='a' * 64, result='blocked')])
-    assert client.accepted_feedback == 1
+    assert sent == dict(market='us', reports=[dict(proxy_key='a' * 64, result='success'),
+                                            dict(proxy_key='a' * 64, result='blocked')])
+    assert client.accepted_feedback == 1  # Count the server's acknowledgement, not guesses.
     assert transport.post.return_value.closed
+
+
+def test_feedback_retains_success_and_only_latest_negative(feed):
+    client, clock, transport = feed
+    client.refresh()
+    for result in ['success', 'success', 'blocked', 'proxy_timeout', 'proxy_ssl']:
+        client.record_result('http://8.8.8.8:8080', result)
+    client.flush_feedback()
+    assert [r['result'] for r in transport.post.call_args.kwargs['json']['reports']] == ['success', 'ssl']
+
+
+def test_feedback_later_real_success_supersedes_old_failure(feed):
+    client, clock, transport = feed
+    client.refresh()
+    for result in ['success', 'blocked', 'success']:
+        client.record_result('http://8.8.8.8:8080', result)
+    client.flush_feedback()
+    assert [r['result'] for r in transport.post.call_args.kwargs['json']['reports']] == ['success']
+
+
+def test_feedback_pairs_stay_ordered_bounded_and_never_split(feed):
+    client, clock, transport = feed
+    for i in range(200):
+        uri = 'http://8.8.%d.%d:80' % (i // 255, i % 255)
+        client.ids[uri] = '%064x' % i
+        client.record_result(uri, 'success')
+        client.record_result(uri, 'blocked')
+    assert len(client.pending) == 128
+    assert sum(len(events) for events in client.pending.values()) == 256
+    client.flush_feedback()
+    reports = transport.post.call_args.kwargs['json']['reports']
+    assert len(reports) == 64 and len(client.pending) == 96
+    for before, after in zip(reports[::2], reports[1::2]):
+        assert before['proxy_key'] == after['proxy_key']
+        assert before['result'] == 'success' and after['result'] == 'blocked'
 
 
 def test_feedback_bounded_and_not_replayed_after_ambiguous_failure(feed):
