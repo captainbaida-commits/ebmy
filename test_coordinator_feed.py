@@ -605,6 +605,29 @@ def test_metrics_require_evidence_bound_memory_and_measure_outage_separately():
     assert metrics.coordinator_fraction() == .75
 
 
+def test_fast_rejections_do_not_outscore_real_success():
+    metrics = PipelineMetrics()
+    for i in range(24):
+        metrics.record_request('a', 'coordinator', 'blocked', .05, 'discovery')
+        metrics.record_request('b', 'legacy', 'success' if i == 0 else 'blocked', 7, 'discovery')
+    assert metrics.coordinator_fraction() == .5
+    assert metrics.public_acceptance() == 1 / 48
+    cold = PipelineMetrics()
+    assert cold.public_acceptance() is None
+
+
+def test_ready_replacements_exclude_current_fixed_ip(scanner, monkeypatch):
+    manager = scanner.ProxyManager()
+    proxies = ['http://8.8.8.%d:80' % i for i in range(1, 5)]
+    twin = 'socks5://8.8.8.1:1080'
+    manager.proxies = proxies + [twin]
+    manager.quality_ok_until = {p: time.time() + 100 for p in proxies + [twin]}
+    monkeypatch.setattr(scanner, 'proxy_manager', manager)
+    monkeypatch.setattr(scanner, 'fixed_proxy', proxies[0])
+    assert scanner._ready_reserve_count() == 3
+    assert manager.reserve_diagnostics()['tls'] == 4
+
+
 def test_main_priority_clears_even_on_exception(scanner, monkeypatch):
     monkeypatch.setattr(scanner, '_fetch_ebay_html_with_fixed_pair_impl', Mock(side_effect=RuntimeError('offline')))
     with pytest.raises(RuntimeError):
