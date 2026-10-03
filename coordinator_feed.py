@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from urllib.parse import urlsplit
+from proxy_runtime import finite_number
 
 import requests
 
@@ -35,6 +36,7 @@ class CoordinatorFeed:
         self.next_refresh = 0.0
         self.failures = 0
         self.ids = OrderedDict()
+        self.metadata = {}
         self.pending = OrderedDict()
         self.last_feedback = 0.0
         self.accepted_feedback = 0
@@ -73,6 +75,16 @@ class CoordinatorFeed:
             if self.clock() >= self.valid_until:
                 return (), 0.0
             return self.rows, self.valid_until
+
+    def metadata_snapshot(self):
+        with self.state_lock:
+            if self.clock() >= self.valid_until:
+                return {}
+            return {uri: dict(value) for uri, value in self.metadata.items()}
+
+    def was_seen(self, proxy):
+        with self.state_lock:
+            return proxy in self.ids
 
     @staticmethod
     def _read_json(response, max_bytes, deadline):
@@ -119,6 +131,7 @@ class CoordinatorFeed:
             if not isinstance(source_rows, list) or len(source_rows) > 500:
                 raise ValueError('invalid rows')
             rows = []
+            metadata = {}
             seen = set()
             for row in source_rows:
                 if not isinstance(row, dict):
@@ -132,6 +145,14 @@ class CoordinatorFeed:
                     continue
                 seen.add(uri)
                 rows.append((uri, key, row.get('strong') is True))
+                metadata[uri] = {
+                    'score': finite_number(row.get('score'), -1000, 1000, 0),
+                    'latency_ms': finite_number(row.get('neutral_latency_ms'), 0, 60000),
+                    'market_quality': finite_number(row.get('market_quality'), 0, 1),
+                    'failure_streak': finite_number(row.get('market_failure_streak'), 0, 100, 0),
+                    'strong': row.get('strong') is True,
+                    'rank': len(rows) - 1,
+                }
                 if len(rows) >= self.limit:
                     break
             # Empty genuine snapshots clear priority; malformed nonempty lists are failures.
@@ -141,6 +162,7 @@ class CoordinatorFeed:
             now = self.clock()
             with self.state_lock:
                 self.rows = tuple(row[0] for row in rows)
+                self.metadata = metadata
                 self.valid_until = now + max(0.0, self.stale_seconds - age)
                 self.next_refresh = now + self.refresh_seconds
                 self.failures = 0
@@ -172,7 +194,7 @@ class CoordinatorFeed:
                 self.refresh_lock.release()
         return self.snapshot()
 
-    def record_result(self, proxy, result):
+    def record_result(self, proxy, result, latency_ms=None):
         """Queue compact outcomes from EXISTING real requests; absolutely no I/O here."""
         mapped = self.RESULT_MAP.get(result)
         if not self.enabled or not mapped:
@@ -183,6 +205,9 @@ class CoordinatorFeed:
                 return
             previous = self.pending.get(key, ())
             latest = {'proxy_key': key, 'result': mapped}
+            latency = finite_number(latency_ms, 0, 120000)
+            if latency is not None:
+                latest['latency_ms'] = round(latency, 1)
             # Preserve a real success preceding the latest failure in this interval.
             # Repeated successes are coalesced; the final negative result still wins
             # server-side and cannot make a blocked endpoint eligible again.
