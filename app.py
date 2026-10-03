@@ -2922,15 +2922,16 @@ class ProxyManager:
                     used_hosts.add(host)
             return quality, tcp_only
 
-    def reserve_diagnostics(self):
+    def reserve_diagnostics(self, excluded_hosts=None):
         """Count independent eligible IPs, with no refresh and no candidate consumption."""
         now = time.time()
+        excluded_hosts = set(excluded_hosts or ())
         with self.lock:
             hosts, ready, durable, known, coordinator_tls = set(), set(), set(), set(), set()
             coordinator_hosts = set()
             for p in self.proxies:
                 host = _proxy_host(p)
-                if (not host or self.bad_until.get(p, 0) > now
+                if (not host or host in excluded_hosts or self.bad_until.get(p, 0) > now
                         or self.host_bad_until.get(host, 0) > now
                         or self.soft_host_penalty_until.get(host, 0) > now):
                     continue
@@ -4054,7 +4055,8 @@ spare_session = SpareSession(close_session, ttl=35)
 
 
 def _ready_reserve_count():
-    return proxy_manager.reserve_diagnostics()['tls']
+    excluded = {_proxy_host(fixed_proxy)} if fixed_proxy else set()
+    return proxy_manager.reserve_diagnostics(excluded_hosts=excluded)['tls']
 
 
 def _fixed_adaptive_timeout(proxy, recovery=False):
@@ -10537,7 +10539,11 @@ def _fetch_ebay_html_with_fixed_pair_impl():
     # now unlocks Premium much sooner. A healthy reserve (3+ quality endpoints) keeps
     # the conservative original timing. Webshare remains untouched at ~30s reserve.
     standby_count = len(fast_standby_queue)
-    if quality_ready <= 1 or standby_count <= 1:
+    public_acceptance = pipeline_metrics.public_acceptance()
+    public_rejected = public_acceptance is not None and public_acceptance < .10
+    if public_rejected:
+        logging.info('⚡ Recent public eBay acceptance=%.1f%%; Premium fast-assist despite neutral TLS readiness', public_acceptance * 100)
+    if quality_ready <= 1 or standby_count <= 1 or public_rejected:
         premium_assist_tier = 'fast'
         local_premium_unlock_after = min(PREMIUM_UNLOCK_AFTER, 1.8)
         local_premium_unlock_attempts = min(PREMIUM_UNLOCK_ATTEMPTS, 2)
@@ -12821,7 +12827,7 @@ def proxy_preflight_warm_worker():
                 target = PROXY_PREFLIGHT_RESERVE_TARGET
                 if adaptive_cadence_mode == 'stressed' and warm_rss is not None and warm_rss < 300:
                     target = max(target, 20)
-                durable = proxy_manager.reserve_diagnostics()['durable_tls']
+                durable = proxy_manager.reserve_diagnostics(excluded_hosts=excluded)['durable_tls']
                 batch_limit = (
                     PROXY_PREFLIGHT_WARM_BATCH
                     if durable < target
@@ -12936,7 +12942,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.47 FAST-FAILOVER работает." +
+        "\n🇺🇸 eBay США monitor v6.47.1 FAST-FAILOVER работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -13053,7 +13059,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.47 FAST-FAILOVER: "
+        "🌐 Multi-provider v6.47.1 FAST-FAILOVER: "
         f"Blitz US={'ON' if coordinator_feed.enabled else 'OFF'}, legacy reserve=ON, "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
@@ -13149,7 +13155,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.47 FastFailover, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.47.1 FastFailover, {role})"
 
 
 @app.route('/health')
