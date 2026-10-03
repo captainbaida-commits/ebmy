@@ -16,6 +16,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import requests
 from coordinator_feed import CoordinatorFeed
+from proxy_runtime import PipelineMetrics, ProbeLimiter, SpareSession, adaptive_timeout
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
@@ -140,6 +141,21 @@ coordinator_feed = CoordinatorFeed(
     token=os.getenv('COORDINATOR_US_TOKEN', ''),
     limit=500,
 )
+pipeline_metrics = PipelineMetrics()
+probe_limiter = ProbeLimiter(8)
+proxy_metadata_wakeup = threading.Event()
+proxy_metadata_lock = threading.Lock()
+proxy_metadata_jobs = set()
+proxy_metadata_busy = threading.Event()
+main_request_pending = threading.Event()
+
+
+def request_proxy_metadata_refresh(tier='standard'):
+    # Coalesced commands: one metadata worker owns all provider network refreshes.
+    with proxy_metadata_lock:
+        proxy_metadata_jobs.add(tier)
+    proxy_metadata_wakeup.set()
+    return False
 
 # PostgreSQL/Aiven: короткие сетевые/SQL timeout защищают worker-ы от долгого зависания
 # при временном сетевом сбое. Никаких ручных изменений в Aiven не требуется.
@@ -189,8 +205,8 @@ LEADER_HEALTH_INTERVAL = max(5, int(os.getenv("LEADER_HEALTH_INTERVAL", "10")))
 
 # Discovery запускается только когда уже нет рабочей fixed-session.
 # V6.27: реальные логи V6.26 показали median failover ~10 сек., но один длинный outlier 44.7 сек.
-# Сохраняем быстрый безопасный разгон: 4 сразу -> 5 после ~8 сек. -> 6 после
-# ~18 сек., не дожидаясь deep-emergency. При живом fixed proxy всё равно выполняется ОДИН
+# Безопасный разгон: 4 сразу -> 5 после 5 сек. -> 6 после 8 сек.;
+# восемь только после 18 сек. при низком RSS и достаточно разных IP. При живом fixed proxy всё равно выполняется ОДИН
 # обычный eBay request — частота основного мониторинга не меняется. Memory guard ниже может
 # динамически вернуть ширину к 4 только около реального лимита RAM Render.
 PROBE_CONCURRENCY = max(4, min(int(os.getenv("PROBE_CONCURRENCY", "4")), 4))
@@ -198,15 +214,16 @@ PROBE_ESCALATED_CONCURRENCY = max(
     PROBE_CONCURRENCY,
     min(int(os.getenv("PROBE_ESCALATED_CONCURRENCY", "5")), 5),
 )
-PROBE_ESCALATE_AFTER = max(5.0, float(os.getenv("PROBE_ESCALATE_AFTER", "8")))
+PROBE_ESCALATE_AFTER = max(4.0, float(os.getenv("PROBE_ESCALATE_AFTER", "5")))
 PROBE_DEEP_CONCURRENCY = max(
     PROBE_ESCALATED_CONCURRENCY,
     min(int(os.getenv("PROBE_DEEP_CONCURRENCY", "6")), 6),
 )
 PROBE_DEEP_ESCALATE_AFTER = max(
     PROBE_ESCALATE_AFTER + 2.0,
-    float(os.getenv("PROBE_DEEP_ESCALATE_AFTER", "18")),
+    float(os.getenv("PROBE_DEEP_ESCALATE_AFTER", "8")),
 )
+PROBE_TURBO_AFTER = max(15.0, float(os.getenv('PROBE_TURBO_AFTER', '18')))
 PROBE_CONNECT_TIMEOUT = float(os.getenv("PROBE_CONNECT_TIMEOUT", "3.5"))
 # В старой версии после 45 сек. timeout искусственно увеличивался до 4.5/12 и один
 # полуживой proxy мог держать целый batch 11+ секунд. При сотнях кандидатов выгоднее
@@ -387,8 +404,9 @@ PROXY_PREFLIGHT_WARM_CONCURRENCY = max(
 )
 PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "15")))
 PROXY_PREFLIGHT_RESERVE_TARGET = max(
-    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "12")), 24)
+    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "16")), 24)
 )
+PROXY_PREFLIGHT_RECHECK_AHEAD = 30.0
 PROXY_PREFLIGHT_MAINTENANCE_BATCH = max(
     2, min(int(os.getenv("PROXY_PREFLIGHT_MAINTENANCE_BATCH", "4")), 8)
 )
@@ -975,6 +993,7 @@ def memory_guard_worker():
             rss = _memory_maintenance('guard', force=False)
             rss = _proactive_memory_housekeeping('guard') if rss is not None else rss
             high = memory_pressure_event.is_set()
+            spare_session.expire(force=is_paused or high or (rss is not None and rss >= MEMORY_PROACTIVE_TRIM_MB))
             now_mono = time.monotonic()
             if rss is not None and now_mono - last_report >= 300:
                 logging.info(
@@ -1179,6 +1198,7 @@ def record_ebay_success():
         last_ebay_success_at = now
         connection_outage_started_at = None
         connection_alert_sent = False
+    pipeline_metrics.success(real_outage)
     if real_outage is not None and real_outage >= CONNECTION_RECOVERY_LOG_AFTER:
         logging.info(
             f"🔄 eBay связь восстановлена после реального сетевого сбоя: "
@@ -1281,7 +1301,7 @@ def _proxy_log_name(proxy):
         port = f":{parts.port}" if parts.port else ''
         scheme = parts.scheme or 'http'
         source = provider_manager.source_label_fast(proxy) if 'provider_manager' in globals() else None
-        if source == 'free' and 'proxy_manager' in globals() and proxy_manager.is_coordinator_proxy_fast(proxy):
+        if source == 'free' and coordinator_feed.was_seen(proxy):
             source = 'free/coordinator'
         suffix = f" [{source}]" if source else ''
         return f"{scheme}://{host}{port}{suffix}"
@@ -2270,6 +2290,7 @@ class ProxyManager:
         self.last_deep_emergency_refresh = 0
         self.refresh_interval = PROXY_REFRESH_INTERVAL
         self.coordinator_current = frozenset()
+        self.coordinator_metadata = {}
         self.coordinator_valid_until = 0.0
 
         # cooldown конкретного protocol://ip:port
@@ -2432,6 +2453,7 @@ class ProxyManager:
             if current == self.coordinator_current and valid_until == self.coordinator_valid_until:
                 return len(rows)
             self.coordinator_current = current
+            self.coordinator_metadata = coordinator_feed.metadata_snapshot()
             self.coordinator_valid_until = valid_until
             if rows:
                 now = time.time()
@@ -2900,6 +2922,35 @@ class ProxyManager:
                     used_hosts.add(host)
             return quality, tcp_only
 
+    def reserve_diagnostics(self):
+        """Count independent eligible IPs, with no refresh and no candidate consumption."""
+        now = time.time()
+        with self.lock:
+            hosts, ready, durable, known, coordinator_tls = set(), set(), set(), set(), set()
+            coordinator_hosts = set()
+            for p in self.proxies:
+                host = _proxy_host(p)
+                if (not host or self.bad_until.get(p, 0) > now
+                        or self.host_bad_until.get(host, 0) > now
+                        or self.soft_host_penalty_until.get(host, 0) > now):
+                    continue
+                hosts.add(host)
+                if provider_manager.source_fast(p) != 'free':
+                    continue
+                if self.is_coordinator_proxy_fast(p, now):
+                    coordinator_hosts.add(host)
+                if self._quality_state_locked(p, now) == 'ok':
+                    ready.add(host)
+                    if self.quality_ok_until.get(p, 0) - now > PROXY_PREFLIGHT_RECHECK_AHEAD:
+                        durable.add(host)
+                    if self.is_coordinator_proxy_fast(p, now):
+                        coordinator_tls.add(host)
+                if self._is_recent_good_locked(p, now) and self.last_failure_result.get(p) in (None, 'proxy_timeout', 'proxy_error'):
+                    known.add(host)
+            return dict(feed=len(self.coordinator_current) if now < self.coordinator_valid_until else 0,
+                        coordinator_ips=len(coordinator_hosts), coordinator_tls=len(coordinator_tls),
+                        tls=len(ready), durable_tls=len(durable), known=len(known), available_ips=len(hosts))
+
     def get_quality_preflight_candidates(self, limit, excluded_hosts=None):
         """Кандидаты, которым ещё не делали свежую HTTPS/TLS quality-проверку."""
         if not PROXY_PREFLIGHT_ENABLED or limit <= 0:
@@ -2922,7 +2973,10 @@ class ProxyManager:
                     continue
                 if self.bad_until.get(p, 0) > now or self.host_bad_until.get(host, 0) > now:
                     continue
-                if self._quality_state_locked(p, now) != 'unknown':
+                quality_state = self._quality_state_locked(p, now)
+                if quality_state == 'bad':
+                    continue
+                if quality_state == 'ok' and self.quality_ok_until.get(p, 0) - now > PROXY_PREFLIGHT_RECHECK_AHEAD:
                     continue
                 if self._preflight_state_locked(p, now) == 'bad':
                     continue
@@ -2933,6 +2987,7 @@ class ProxyManager:
             # Still perform our OWN TLS check; never clear local bad/host cooldowns.
             rows.sort(
                 key=lambda p: (
+                    1 if self._quality_state_locked(p, now) == 'ok' else 0,
                     1 if (self._is_recent_good_locked(p, now)
                           and self.fail_streak.get(p, 0) <= 2
                           and self.last_failure_result.get(p) in (None, 'proxy_timeout', 'proxy_error')) else 0,
@@ -2943,10 +2998,15 @@ class ProxyManager:
                 reverse=True,
             )
             result = []
+            rechecks = 0
             for p in rows:
                 host = _proxy_host(p)
                 if host in used_hosts:
                     continue
+                due = self._quality_state_locked(p, now) == 'ok'
+                if due and rechecks >= min(4, limit):
+                    continue
+                rechecks += int(due)
                 result.append(p)
                 used_hosts.add(host)
                 if len(result) >= limit:
@@ -2987,6 +3047,7 @@ class ProxyManager:
                 if self.soft_host_penalty_until.get(host, 0) > now:
                     continue
                 if (self.is_coordinator_proxy_fast(p, now)
+                        and self._quality_state_locked(p, now) == 'ok'
                         and self._preflight_state_locked(p, now) != 'bad'
                         and self._quality_state_locked(p, now) != 'bad'
                         and not self._host_recent_outage_locked(host, now)):
@@ -3037,11 +3098,14 @@ class ProxyManager:
 
             add_group(known)
             # Share the existing free reserve budget: no longer first failover wave.
-            coordinator_added = add_group(coordinator, max_from_group=2)
+            coordinator_slots = max(1, min(WARM_STANDBY_FREE_QUALITY_LIMIT - 1,
+                                          round(WARM_STANDBY_FREE_QUALITY_LIMIT * pipeline_metrics.coordinator_fraction())))
+            coordinator_added = add_group(coordinator, max_from_group=coordinator_slots)
             # Реальный v6.20 log показал, что 10-12 neutral HTTPS-ready FREE подряд
             # задерживали managed providers. Держим глубокий reserve в памяти, но первая
             # failover-wave использует только несколько таких адресов.
             free_quality = [p for p in quality if provider_manager.source_fast(p) == 'free']
+            free_quality.sort(key=lambda p: self.is_coordinator_proxy_fast(p, now))
             add_group(free_quality, max_from_group=max(
                 0, WARM_STANDBY_FREE_QUALITY_LIMIT - coordinator_added))
             # TCP-only — слабый сигнал. Не заполняем им весь первый batch.
@@ -3202,6 +3266,20 @@ class ProxyManager:
         # emergency-only endpoint. Совсем новый standard endpoint — ещё небольшой бонус.
         standard_bonus = 10.0 if proxy in self.standard_current else 0.0
         coordinator_bonus = 35.0 if self.is_coordinator_proxy_fast(proxy, now) else 0.0
+        remote_bonus = 0.0
+        if coordinator_bonus:
+            metadata = self.coordinator_metadata.get(proxy, {})
+            remote_bonus = max(0, 18 - metadata.get('rank', 500) * .4)
+            remote_bonus += max(-5.0, min(5.0, metadata.get('score', 0) / 20.0))
+            market_quality = metadata.get('market_quality')
+            if market_quality is not None:
+                remote_bonus += 8.0 * market_quality
+            latency = metadata.get('latency_ms')
+            if latency is not None:
+                remote_bonus += max(0, 8 - latency / 400)
+            remote_bonus -= min(12, metadata.get('failure_streak', 0) * 2)
+        local_latency = pipeline_metrics.successful_latency(hashlib.sha256(proxy.encode()).hexdigest())
+        latency_bonus = max(0, 10 - local_latency) if local_latency is not None else 0.0
         first_seen = self.standard_first_seen_at.get(proxy, 0)
         fresh_standard_bonus = 0.0
         if proxy in self.standard_current and first_seen and (now - first_seen) <= 120:
@@ -3234,7 +3312,7 @@ class ProxyManager:
 
         return (
             recent_bonus + success_bonus + standard_bonus + fresh_standard_bonus + coordinator_bonus
-            + scheme_bonus + idle_bonus + preflight_bonus + quality_bonus + provider_bonus
+            + scheme_bonus + idle_bonus + preflight_bonus + quality_bonus + provider_bonus + remote_bonus + latency_bonus
             - fail_penalty - unstable_penalty - reason_penalty
             - quality_bad_penalty - soft_penalty - outage_penalty
             + random.uniform(0, 2.0)
@@ -3363,7 +3441,7 @@ class ProxyManager:
                 and (now - self.last_emergency_refresh) < emergency_hold
             )
         if not emergency_recent:
-            self.refresh_proxies()
+            request_proxy_metadata_refresh()
         now = time.time()
 
         with self.lock:
@@ -3479,11 +3557,13 @@ class ProxyManager:
                     if len(batch) >= batch_size:
                         return batch
 
-            # Fresh coordinator entries get the first HALF of the replacement batch.
-            # Actual recent eBay successes above stay first; the other half can immediately
+            # Fresh coordinator entries get an adaptive share of the replacement batch.
+            # Actual recent eBay successes above stay first; independent slots can immediately
             # use the existing managed/legacy reserve rather than wait for all Blitz IPs.
             coordinator_added = 0
-            coordinator_limit = max(1, batch_size // 2)
+            coordinator_limit = max(1, min(batch_size - 1, round(batch_size * pipeline_metrics.coordinator_fraction())))
+            if allow_webshare and allow_premium:
+                coordinator_limit = max(1, min(coordinator_limit, batch_size - 2))
             recycled_set = set(recycled_usable)
             for p in usable:
                 if (provider_manager.source_fast(p) == 'free'
@@ -3549,9 +3629,16 @@ class ProxyManager:
                         break
 
             # Один слот по возможности оставляем уже доказанному HTTPS/TLS free-reserve.
-            for p in non_webshare_quality:
+            independent_quality = [p for p in non_webshare_quality if not self.is_coordinator_proxy_fast(p, now)]
+            for p in independent_quality + non_webshare_quality:
                 if provider_manager.source_fast(p) == 'free' and add_candidate(p):
                     break
+
+            if (len(batch) < batch_size and batch and all(
+                    self.is_coordinator_proxy_fast(p, now) for p in batch)):
+                for p in non_webshare_usable:
+                    if not self.is_coordinator_proxy_fast(p, now) and add_candidate(p):
+                        break
 
             # Если verified-free не было, свободные места снова отдаём Premium.
             if len(batch) < batch_size:
@@ -3962,6 +4049,71 @@ def close_session(session):
         session.close()
     except Exception:
         pass
+
+spare_session = SpareSession(close_session, ttl=35)
+
+
+def _ready_reserve_count():
+    return proxy_manager.reserve_diagnostics()['tls']
+
+
+def _fixed_adaptive_timeout(proxy, recovery=False):
+    baseline = ((FIXED_RECOVERY_CONNECT_TIMEOUT, FIXED_RECOVERY_READ_TIMEOUT) if recovery
+                else (FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT))
+    latency = pipeline_metrics.successful_latency(hashlib.sha256(proxy.encode()).hexdigest())
+    return adaptive_timeout(baseline, latency, _ready_reserve_count(), recovery)
+
+
+def _spare_proxy_eligible(proxy):
+    if is_paused or memory_pressure_event.is_set() or provider_manager.source_fast(proxy) == 'webshare':
+        return False
+    rss = _memory_rss_mb()
+    if rss is not None and rss >= MEMORY_PROACTIVE_TRIM_MB:
+        return False
+    if not provider_manager.managed_proxy_available(proxy):
+        return False
+    now, host = time.time(), _proxy_host(proxy)
+    with proxy_manager.lock:
+        return (proxy_manager.bad_until.get(proxy, 0) <= now
+                and proxy_manager.host_bad_until.get(host, 0) <= now
+                and proxy_manager.soft_host_penalty_until.get(host, 0) <= now)
+
+
+def _offer_spare_session(proxy, profile, session):
+    """Takes ownership even on rejection. Never store HTML or open an extra connection."""
+    if (profile is not None and _spare_proxy_eligible(proxy)
+            and _proxy_host(proxy) != _proxy_host(fixed_proxy or '')
+            and spare_session.offer(proxy, profile, session)):
+        logging.info('⚡ Spare Session retained from existing successful probe: %s; TTL=35s', _proxy_log_name(proxy))
+        return True
+    close_session(session)
+    return False
+
+
+def _adopt_spare_session():
+    global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
+    ready = spare_session.take(_spare_proxy_eligible)
+    if ready is None:
+        return None
+    proxy, profile, session = ready
+    result, html, returned = _make_request(proxy, profile, session=session,
+                                          timeout=(PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+                                          request_kind='standby')
+    if result == 'success':
+        fixed_proxy, fixed_profile, fixed_session = proxy, profile, returned
+        fixed_pair_since_monotonic = time.monotonic()
+        proxy_manager.mark_success(proxy)
+        record_ebay_success()
+        _queue_restart_sticky_persist(proxy, force=True)
+        proxy_preflight_wakeup_event.set()
+        wake_queued_auctions_for_new_fixed()
+        logging.info('⚡ Spare Session adopted after fresh eBay validation: %s', _proxy_log_name(proxy))
+        return html
+    close_session(session)
+    if result != 'profile_error':
+        proxy_manager.mark_failure(proxy, result, reason='spare Session ' + result)
+        _auction_proxy_soft_host_penalty(proxy, result)
+    return None
 
 # ============ БАЗА ДАННЫХ ============
 def get_db_connection(application_name='ebay_us_bot'):
@@ -5967,7 +6119,12 @@ def _request_auction_via_main_session(url, connect_timeout=None, read_timeout=No
     read_timeout = AUCTION_FETCH_READ_TIMEOUT if read_timeout is None else read_timeout
     wait_timeout = AUCTION_MAIN_PROXY_WAIT if wait_timeout is None else max(0.0, float(wait_timeout))
 
+    if main_request_pending.is_set():
+        return None, '', 'main_busy', fixed_proxy
     acquired = main_fixed_request_lock.acquire(timeout=wait_timeout)
+    if acquired and main_request_pending.is_set():
+        main_fixed_request_lock.release()
+        return None, '', 'main_busy', fixed_proxy
     if not acquired:
         current = fixed_proxy
         if current:
@@ -6121,7 +6278,7 @@ def fetch_auction_pages(
     # Если после auction-only cooldown кандидатов мало, один emergency merge расширяет
     # список, но не запускает полный main discovery и не меняет fixed_proxy.
     if len(candidates) < min(2, max_reserve_proxies) and max_reserve_proxies > len(candidates):
-        proxy_manager.refresh_proxies(force=True, emergency=True)
+        request_proxy_metadata_refresh('emergency')
         extra_need = max(0, max_reserve_proxies - len(candidates))
         if extra_need:
             extra = proxy_manager.get_candidate_batch(
@@ -9321,6 +9478,8 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
     if timeout is None:
         timeout = (FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT)
 
+    request_started = time.monotonic()
+
     def tracked_return(result, html_value, session_value, body_bytes=0):
         # One central accounting point prevents the misleading v6.20 stats where only
         # a fixed-session recovery was counted while discovery/fixed traffic was missing.
@@ -9329,7 +9488,11 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
                 proxy, result, body_bytes=body_bytes, request_kind=request_kind
             )
             provider_manager.maybe_warn_webshare_usage()
-            coordinator_feed.record_result(proxy, result)
+            seconds = time.monotonic() - request_started
+            source = provider_manager.source_fast(proxy)
+            origin = ('coordinator' if coordinator_feed.was_seen(proxy) else 'legacy') if source == 'free' else source
+            pipeline_metrics.record_request(hashlib.sha256(proxy.encode()).hexdigest(), origin, result, seconds, request_kind)
+            coordinator_feed.record_result(proxy, result, latency_ms=seconds * 1000.0)
         return result, html_value, session_value
 
     own_session = session is None
@@ -9521,7 +9684,7 @@ def _quality_recv_headers(sock, deadline, max_bytes=8192):
     return bytes(data)
 
 
-def _quality_https_preflight_proxy(proxy):
+def _quality_https_preflight_proxy(proxy, force=False):
     """
     Строгий ФОНОВЫЙ health-check без HTTP-запроса к eBay:
       proxy TCP -> HTTP CONNECT/SOCKS5 CONNECT -> TLS handshake к example.com -> close.
@@ -9534,7 +9697,7 @@ def _quality_https_preflight_proxy(proxy):
         return False, 'disabled'
 
     state = proxy_manager.quality_state(proxy)
-    if state == 'ok':
+    if state == 'ok' and not force:
         return True, None
     if state == 'bad':
         return False, proxy_manager.quality_failure_result(proxy)
@@ -9688,7 +9851,8 @@ def _probe_proxy(proxy, profile, timeout, stop_event=None):
     )
     if stop_event is not None and stop_event.is_set() and result == 'success':
         html = None
-        close_session(session)
+        proxy_manager.mark_success(proxy)
+        _offer_spare_session(proxy, profile, session)
         return 'late_success', None, None
     return result, html, session
 
@@ -9706,6 +9870,9 @@ def _cleanup_late_probe_future(future, proxy):
     try:
         if result in ('success', 'late_success'):
             proxy_manager.mark_success(proxy)
+            if session is not None:
+                _offer_spare_session(proxy, getattr(future, '_probe_profile', None), session)
+                session = None
             logging.info(f"🟢 Запомнен запасной успешный proxy {_proxy_log_name(proxy)} (late probe)")
         elif result in ('cancelled', 'profile_error'):
             pass
@@ -9892,7 +10059,7 @@ def webshare_handoff_worker():
                 WEBSHARE_HANDOFF_BATCH, excluded_hosts=excluded
             )
             if not candidates:
-                proxy_manager.refresh_proxies(force=False, emergency=False)
+                request_proxy_metadata_refresh()
                 candidates = proxy_manager.get_free_handoff_candidates(
                     WEBSHARE_HANDOFF_BATCH, excluded_hosts=excluded
                 )
@@ -9909,13 +10076,13 @@ def webshare_handoff_worker():
                 max_workers=min(WEBSHARE_HANDOFF_CONCURRENCY, len(candidates)),
                 thread_name_prefix='webshare-handoff',
             )
-            future_to_proxy = {
-                executor.submit(
-                    _probe_proxy, candidate, profile,
-                    (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
-                ): candidate
-                for candidate in candidates
-            }
+            future_to_proxy = {}
+            for candidate in candidates:
+                future = probe_limiter.submit(executor, _probe_proxy, candidate, profile,
+                                              (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT), identity=_proxy_host(candidate))
+                if future is not None:
+                    future._probe_profile = profile
+                    future_to_proxy[future] = candidate
             winner = None
             try:
                 while future_to_proxy and winner is None:
@@ -10120,8 +10287,22 @@ def _quarantine_fixed_after_soft_search_shell(html):
 
 
 def fetch_ebay_html_with_fixed_pair():
+    # Keep auction readers out during a failed-session close/replace as well as during
+    # the request itself. Always clear on exceptions so auctions cannot remain starved.
+    main_request_pending.set()
+    try:
+        return _fetch_ebay_html_with_fixed_pair_impl()
+    finally:
+        main_request_pending.clear()
+
+
+def _fetch_ebay_html_with_fixed_pair_impl():
     global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
 
+    if fixed_proxy is None:
+        spare_html = _adopt_spare_session()
+        if spare_html is not None:
+            return spare_html
     handoff_html = _adopt_webshare_handoff_if_ready()
     if handoff_html:
         record_ebay_success()
@@ -10142,12 +10323,16 @@ def fetch_ebay_html_with_fixed_pair():
         old_proxy = fixed_proxy
         old_profile = fixed_profile
         fixed_attempt_started = time.monotonic()
+        main_request_pending.set()
+        lock_started = time.monotonic()
         with main_fixed_request_lock:
+            pipeline_metrics.stage("fixed_lock", time.monotonic() - lock_started)
+            fixed_attempt_started = time.monotonic()
             result, html, returned_session = _make_request(
                 old_proxy,
                 old_profile,
                 session=fixed_session,
-                timeout=(FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT),
+                timeout=_fixed_adaptive_timeout(old_proxy),
                 request_kind='fixed',
             )
         fixed_attempt_elapsed = time.monotonic() - fixed_attempt_started
@@ -10179,7 +10364,8 @@ def fetch_ebay_html_with_fixed_pair():
             result in ('proxy_timeout', 'proxy_error')
             and proxy_manager.is_recent_good(old_proxy)
         )
-        if can_recover_fixed and fixed_attempt_elapsed >= FIXED_RECOVERY_SKIP_AFTER:
+        recovery_skip_after = min(FIXED_RECOVERY_SKIP_AFTER, 8.0) if _ready_reserve_count() >= 4 else FIXED_RECOVERY_SKIP_AFTER
+        if can_recover_fixed and fixed_attempt_elapsed >= recovery_skip_after:
             logging.info(
                 f"⚡ Fixed proxy уже ждал {fixed_attempt_elapsed:.1f} сек.; "
                 f"recovery пропускаем и сразу переключаемся на reserve/discovery"
@@ -10193,12 +10379,13 @@ def fetch_ebay_html_with_fixed_pair():
             fixed_session = None
             time.sleep(random.uniform(0.4, 0.8))
 
+            main_request_pending.set()
             with main_fixed_request_lock:
                 retry_result, retry_html, retry_session = _make_request(
                     old_proxy,
                     old_profile,
                     session=None,
-                    timeout=(FIXED_RECOVERY_CONNECT_TIMEOUT, FIXED_RECOVERY_READ_TIMEOUT),
+                    timeout=_fixed_adaptive_timeout(old_proxy, recovery=True),
                     request_kind='recovery',
                 )
             if retry_result == 'success':
@@ -10235,17 +10422,15 @@ def fetch_ebay_html_with_fixed_pair():
             )
             _auction_proxy_soft_host_penalty(old_proxy, result)
 
+        spare_html = _adopt_spare_session()
+        if spare_html is not None:
+            return spare_html
+
         # Не ждём нового ProxyScrape snapshot, если background worker уже подготовил резерв.
         # Берём только свежие known-good / HTTPS-TLS-ready endpoint-ы (+ максимум 1 TCP-only).
         fast_standby_queue = proxy_manager.get_warm_standby_candidates(
             WARM_STANDBY_TOTAL_LIMIT,
             excluded_hosts={_proxy_host(old_proxy)},
-        )
-        # HTTP won every discovery in the supplied production window. Keep SOCKS5 as
-        # fallback, but let equally warm HTTP endpoints occupy the earliest slots.
-        fast_standby_queue = (
-            [p for p in fast_standby_queue if _proxy_scheme(p) in ('http', 'https')]
-            + [p for p in fast_standby_queue if _proxy_scheme(p) == 'socks5']
         )
         quality_ready = sum(
             1 for p in fast_standby_queue
@@ -10278,13 +10463,14 @@ def fetch_ebay_html_with_fixed_pair():
     # V6.20: сначала обновляем управляемые источники. Ошибка их API полностью fail-open:
     # старый бесплатный ProxyScrape остаётся независимым fallback.
     # V6.25 trims old parser/curl arenas before starting a multi-session failover burst.
+    started = time.monotonic()
     _memory_maintenance('before discovery', force=True)
-    provider_manager.refresh_all(force=False, include_stats=False)
+    request_proxy_metadata_refresh()
 
     # На свежем старте сначала ОБЯЗАТЕЛЬНО загружаем обычный Render PROXY_LIST
     # (timeout=1500). Emergency 3000 не имеет права включаться на пустом 0/0 pool.
     if not proxy_manager.standard_pool_loaded():
-        proxy_manager.refresh_proxies(force=True, emergency=False)
+        request_proxy_metadata_refresh()
 
     # V6.30: on a fresh leader process, try the exact last eBay-proven endpoint ONCE
     # before broad discovery. Render deploys discard RAM state, but the old process may
@@ -10371,7 +10557,7 @@ def fetch_ebay_html_with_fixed_pair():
             f"{local_premium_unlock_after:.1f}s/{local_premium_unlock_attempts} attempts"
         )
 
-    started = time.monotonic()
+    pipeline_metrics.stage("preparation", time.monotonic() - started)
     tried_hosts = set()
     tried_proxies = set()
     reprobed_proxies = set()
@@ -10393,7 +10579,7 @@ def fetch_ebay_html_with_fixed_pair():
     # construction itself ever failed, background workers must not remain paused by a
     # stale event. From this point main failover owns the network/memory budget.
     executor = ThreadPoolExecutor(
-        max_workers=PROBE_DEEP_CONCURRENCY,
+        max_workers=max(8, PROBE_DEEP_CONCURRENCY),
         thread_name_prefix='proxy-probe',
     )
     main_discovery_active_event.set()
@@ -10421,6 +10607,10 @@ def fetch_ebay_html_with_fixed_pair():
             # native-memory burst. Healthy post-restart RSS never enters this branch.
             desired = min(3, PROBE_CONCURRENCY)
             reason = f'elevated-memory RSS≈{rss_now:.0f}MB'
+        elif (elapsed_now >= PROBE_TURBO_AFTER and rss_now is not None and rss_now < 300
+              and proxy_manager.reserve_diagnostics()['available_ips'] >= 16):
+            desired = 8
+            reason = f'long search={elapsed_now:.1f}s, healthy RSS≈{rss_now:.0f}MB'
         elif elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
             desired = PROBE_DEEP_CONCURRENCY
             reason = f'elapsed={elapsed_now:.1f}s'
@@ -10454,7 +10644,7 @@ def fetch_ebay_html_with_fixed_pair():
             f"🔄 Длинный discovery: мягко обновляем standard 1500-ms pool "
             f"после {elapsed_now:.0f} сек./{attempts} probe"
         )
-        return proxy_manager.refresh_standard_merge(force=True)
+        return request_proxy_metadata_refresh('merge')
 
     def maybe_load_emergency(force=False):
         nonlocal emergency_loaded
@@ -10482,7 +10672,7 @@ def fetch_ebay_html_with_fixed_pair():
         # В обычном trigger/depleted режиме используем недавний уже слитый 3000-ms
         # snapshot повторно; force=True применяется только когда кандидаты реально
         # исчерпаны внутри текущего discovery.
-        proxy_manager.refresh_proxies(force=force, emergency=True)
+        request_proxy_metadata_refresh('emergency')
         emergency_loaded = True
         return True
 
@@ -10502,7 +10692,7 @@ def fetch_ebay_html_with_fixed_pair():
             f"🆘🆘 Включаем deep-emergency ProxyScrape timeout={PROXY_DEEP_EMERGENCY_TIMEOUT_MS} ms: "
             f"поиск уже {elapsed_now:.0f} сек./{attempts} probe без успеха"
         )
-        proxy_manager.refresh_deep_emergency(force=False)
+        request_proxy_metadata_refresh('deep')
         deep_emergency_loaded = True
         return True
 
@@ -10709,7 +10899,7 @@ def fetch_ebay_html_with_fixed_pair():
                     batch_kinds[p] = 'Emergency probe'
             elif not refreshed_after_exhaustion:
                 logging.info("♻️ Emergency-кандидаты исчерпаны; один раз обновляем расширенный список")
-                proxy_manager.refresh_proxies(force=True, emergency=True)
+                request_proxy_metadata_refresh('emergency')
                 refreshed_after_exhaustion = True
                 elapsed_provider = time.monotonic() - started
                 premium_unlocked = (
@@ -10780,6 +10970,13 @@ def fetch_ebay_html_with_fixed_pair():
             is_webshare_extra = kind == 'Webshare reserve extra'
             if not (is_final_extra or is_webshare_extra) and attempts >= MAX_SEARCH_ATTEMPTS:
                 break
+            future = probe_limiter.submit(
+                executor, _probe_proxy, proxy, profile,
+                (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT), discovery_winner_event, identity=_proxy_host(proxy),
+            )
+            if future is None:
+                break
+            future._probe_profile = profile
             tried_hosts.add(_proxy_host(proxy))
             tried_proxies.add(proxy)
             proxy_manager.remember_outage_attempt(proxy)
@@ -10799,15 +10996,8 @@ def fetch_ebay_html_with_fixed_pair():
             logging.info(
                 f"🔍 {kind} {attempts}/{limit_label}: proxy {_proxy_log_name(proxy)}, профиль {profile['name']}"
             )
-            future = executor.submit(
-                _probe_proxy,
-                proxy,
-                profile,
-                (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
-                discovery_winner_event,
-            )
             future_to_proxy[future] = proxy
-        return bool(batch)
+        return bool(future_to_proxy)
 
     try:
         submit_more()
@@ -10832,6 +11022,9 @@ def fetch_ebay_html_with_fixed_pair():
                 if submit_more():
                     continue
                 elapsed_now = time.monotonic() - started
+                if probe_limiter.count() or proxy_metadata_busy.is_set() or not proxy_manager.standard_pool_loaded():
+                    time.sleep(.2)
+                    continue
                 if (
                     elapsed_now < WEBSHARE_RESERVE_DELAY
                     and provider_manager.has_usable_webshare()
@@ -10880,7 +11073,7 @@ def fetch_ebay_html_with_fixed_pair():
                 if result == 'success':
                     proxy_manager.mark_success(proxy)
                     if winner is None:
-                        winner = (proxy, html, session)
+                        winner = (proxy, html, session, getattr(future, '_probe_profile', profile))
                         discovery_winner_event.set()
                     else:
                         # Несколько probes могут завершиться одним wait() одновременно.
@@ -10888,7 +11081,7 @@ def fetch_ebay_html_with_fixed_pair():
                         # сразу освобождаем, чтобы не держать несколько полных eBay pages.
                         html = None
                         logging.info(f"🟢 Запомнен запасной успешный proxy {_proxy_log_name(proxy)} (same batch)")
-                        close_session(session)
+                        _offer_spare_session(proxy, getattr(future, '_probe_profile', profile), session)
                 elif result == 'late_success':
                     proxy_manager.mark_success(proxy)
                     logging.info(f"🟢 Запомнен запасной успешный proxy {_proxy_log_name(proxy)} (late probe, body dropped)")
@@ -10915,9 +11108,9 @@ def fetch_ebay_html_with_fixed_pair():
                 future_to_proxy.clear()
                 executor.shutdown(wait=False, cancel_futures=True)
 
-                winner_proxy, winner_html, winner_session = winner
+                winner_proxy, winner_html, winner_session, winner_profile = winner
                 fixed_proxy = winner_proxy
-                fixed_profile = profile
+                fixed_profile = winner_profile
                 fixed_session = winner_session
                 fixed_pair_since_monotonic = time.monotonic()
                 record_ebay_success()
@@ -10930,6 +11123,7 @@ def fetch_ebay_html_with_fixed_pair():
                     webshare_handoff_wakeup_event.set()
                 discovery_elapsed = time.monotonic() - started
                 provider_manager.record_winner(winner_proxy, discovery_elapsed, attempts)
+                pipeline_metrics.stage("discovery", discovery_elapsed)
                 logging.info(
                     f"✅ Найдена рабочая пара: proxy {_proxy_log_name(winner_proxy)}, "
                     f"source={provider_manager.source_fast(winner_proxy)}, профиль {profile['name']}; "
@@ -10961,10 +11155,10 @@ def fetch_ebay_html_with_fixed_pair():
     # выбрасывая уже добавленные 3000/4000-ms candidates. Это особенно важно при
     # истощённом пуле: раньше каждый короткий цикл заново скачивал тот же emergency
     # список и терял время, хотя новых endpoint не появлялось.
-    proxy_manager.refresh_standard_merge(force=True)
+    request_proxy_metadata_refresh('merge')
     if proxy_manager.emergency_needed():
-        proxy_manager.refresh_proxies(force=False, emergency=True)
-        proxy_manager.refresh_deep_emergency(force=False)
+        request_proxy_metadata_refresh('emergency')
+        request_proxy_metadata_refresh('deep')
     return None
 
 def fetch_ebay_html_with_retry():
@@ -12526,6 +12720,65 @@ def check_and_send_new_items():
 
     return 'ok'
 
+def proxy_metadata_worker():
+    """One network owner for source updates; discovery reads snapshots immediately."""
+    db_ready_event.wait()
+    next_poll = 0.0
+    logging.info('⚡ Proxy metadata worker started; source APIs never block main failover')
+    while True:
+        try:
+            rss = _memory_rss_mb()
+            spare_session.expire(force=is_paused or memory_pressure_event.is_set()
+                                 or (rss is not None and rss >= MEMORY_PROACTIVE_TRIM_MB))
+            with proxy_metadata_lock:
+                jobs = set(proxy_metadata_jobs)
+                proxy_metadata_jobs.clear()
+            now = time.monotonic()
+            poll = now >= next_poll
+            urgent = jobs & {'merge', 'emergency', 'deep'}
+            if not is_paused and (poll or urgent):
+                proxy_metadata_busy.set()
+                try:
+                    proxy_manager.refresh_coordinator()
+                    # Retain emergency tiers during an active outage. Normal refresh must
+                    # not shrink a just-expanded pool halfway through the same discovery.
+                    with proxy_manager.lock:
+                        emergency_recent = (proxy_manager.last_emergency_refresh > proxy_manager.last_refresh
+                                            and time.time() - proxy_manager.last_emergency_refresh
+                                            < max(proxy_manager.refresh_interval, SEARCH_TIME_BUDGET + 15))
+                    if 'merge' in jobs:
+                        proxy_manager.refresh_standard_merge(force=True)
+                    elif poll and not emergency_recent:
+                        proxy_manager.refresh_proxies(force=False, emergency=False)
+                    # A standard pool is bootstrapped before enabling broader legacy tiers.
+                    if proxy_manager.standard_pool_loaded():
+                        if 'emergency' in jobs:
+                            proxy_manager.refresh_proxies(force=False, emergency=True)
+                        if 'deep' in jobs:
+                            proxy_manager.refresh_deep_emergency(force=False)
+                    elif urgent:
+                        with proxy_metadata_lock:
+                            proxy_metadata_jobs.update(urgent)
+                    if poll:
+                        provider_manager.refresh_all(force=False, include_stats=True)
+                finally:
+                    proxy_metadata_busy.clear()
+                    if poll:
+                        next_poll = time.monotonic() + 15.0
+            summary = pipeline_metrics.snapshot_if_due()
+            if summary:
+                logging.info('📊 Proxy pipeline: %s; reserve=%s; active_probes=%d/8; spare=%d; coordinator_share=%.0f%%',
+                             json.dumps(summary, sort_keys=True), proxy_manager.reserve_diagnostics(),
+                             probe_limiter.count(), spare_session.count(), pipeline_metrics.coordinator_fraction() * 100)
+            proxy_metadata_wakeup.wait(timeout=5.0)
+            proxy_metadata_wakeup.clear()
+        except Exception as error:
+            proxy_metadata_busy.clear()
+            logging.warning('Proxy metadata worker recovered (%s)', type(error).__name__)
+            proxy_metadata_wakeup.wait(timeout=5.0)
+            proxy_metadata_wakeup.clear()
+
+
 def proxy_preflight_warm_worker():
     """
     Пока fixed proxy исправен, поддерживает свежий резерв БЕЗ eBay HTTP-запросов.
@@ -12545,10 +12798,8 @@ def proxy_preflight_warm_worker():
 
     while True:
         try:
-            # Tiny metadata/feedback updates keep Blitz fresh even when memory pressure
-            # temporarily suspends background TLS warming. Reuse this existing worker.
             if not is_paused:
-                proxy_manager.refresh_coordinator()
+                request_proxy_metadata_refresh()
             if (
                 not PROXY_PREFLIGHT_ENABLED
                 or PROXY_PREFLIGHT_WARM_BATCH <= 0
@@ -12562,21 +12813,18 @@ def proxy_preflight_warm_worker():
                 proxy_preflight_wakeup_event.clear()
                 continue
 
-            # Managed provider lists are metadata/API calls only; they do not consume proxy bandwidth.
-            provider_manager.refresh_all(force=False)
-
-            # Пока fixed работает, поддерживаем не только health-cache, но и СВЕЖИЙ
-            # standard ProxyScrape snapshot. Внутренний refresh_interval ограничивает
-            # это примерно одним скачиванием в минуту; warm reserve при refresh сохраняется.
-            proxy_manager.refresh_proxies(force=False, emergency=False)
-
             excluded = {_proxy_host(fixed_proxy)} if fixed_proxy else set()
 
             if PROXY_QUALITY_PREFLIGHT_ENABLED:
                 quality_before, tcp_before = proxy_manager.warm_reserve_stats()
+                warm_rss = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+                target = PROXY_PREFLIGHT_RESERVE_TARGET
+                if adaptive_cadence_mode == 'stressed' and warm_rss is not None and warm_rss < 300:
+                    target = max(target, 20)
+                durable = proxy_manager.reserve_diagnostics()['durable_tls']
                 batch_limit = (
                     PROXY_PREFLIGHT_WARM_BATCH
-                    if quality_before < PROXY_PREFLIGHT_RESERVE_TARGET
+                    if durable < target
                     else PROXY_PREFLIGHT_MAINTENANCE_BATCH
                 )
                 warm_rss = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
@@ -12601,7 +12849,7 @@ def proxy_preflight_warm_worker():
                         thread_name_prefix='proxy-quality-preflight',
                     ) as executor:
                         future_map = {
-                            executor.submit(_quality_https_preflight_proxy, p): p
+                            executor.submit(_quality_https_preflight_proxy, p, True): p
                             for p in candidates
                         }
                         for future in future_map:
@@ -12623,7 +12871,7 @@ def proxy_preflight_warm_worker():
                         f"{k}={v}" for k, v in sorted(reason_counts.items())
                     ) or 'нет'
                     logging.info(
-                        f"🧪 Smart reserve: HTTPS-ready={quality_after}, TCP-only={tcp_after}; "
+                        f"🧪 Smart reserve: HTTPS-ready={quality_after}, target={target}, TCP-only={tcp_after}; "
                         f"проверено={checked}, quality_ok={ok_count}, failures[{failure_summary}]"
                     )
             else:
@@ -12688,7 +12936,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.46 RESERVE-READY работает." +
+        "\n🇺🇸 eBay США monitor v6.47 FAST-FAILOVER работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -12805,7 +13053,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.46 RESERVE-READY: "
+        "🌐 Multi-provider v6.47 FAST-FAILOVER: "
         f"Blitz US={'ON' if coordinator_feed.enabled else 'OFF'}, legacy reserve=ON, "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
@@ -12857,6 +13105,7 @@ def start_leader_workers():
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
+    threading.Thread(target=proxy_metadata_worker, daemon=True, name='proxy-metadata-worker').start()
     threading.Thread(target=proxy_preflight_warm_worker, daemon=True, name='proxy-preflight-worker').start()
     threading.Thread(target=webshare_handoff_worker, daemon=True, name='webshare-handoff-worker').start()
     threading.Thread(target=auction_link_worker, daemon=True, name='auction-link-worker').start()
@@ -12900,7 +13149,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.46 ReserveReady, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.47 FastFailover, {role})"
 
 
 @app.route('/health')
