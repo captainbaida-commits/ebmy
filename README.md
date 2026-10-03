@@ -1,55 +1,29 @@
-# US eBay scanner: optional coordinator integration (v6.45)
+# US eBay scanner: coordinator and fast failover (v6.47)
 
-The Blitz US feed adds an independent, prioritized public proxy pool. Existing
-`PROXY_LIST`, ProxyScrape Premium and Webshare remain available with their original
-cooldowns, circuits, traffic limits and rescue conditions. A proven working fixed
-session is never replaced just to change its source.
+The Blitz US feed is the preferred public pool. Existing PROXY_LIST, ProxyScrape Premium and Webshare remain independent backups. A working fixed Session stays in use. Store only the existing US feed token and coordinator HTTPS origin in Render Environment; credentials never belong in this repository.
 
-Set `COORDINATOR_BASE_URL` to the coordinator HTTPS origin and
-`COORDINATOR_US_TOKEN` to its existing **US feed** token in Render Environment.
-Never commit credentials, use the admin token, or put a token in a URL. With either
-setting absent or invalid, the original providers continue operating.
+## Selection and failover
 
-## Selection and outages
+- Actual recent eBay successes stay first, including SOCKS5. An immediate standby candidate must have local TLS/TCP readiness or real success; remote neutral health alone does not consume a ready slot.
+- Fresh coordinator candidates normally receive about 75% of discovery/free standby slots, with an independent backup slot where available. After at least 12 actual discovery samples from each public group, this falls to 50% if coordinator success per second is clearly worse. Premium unlock, Webshare rescue delay, usage quotas and provider circuits still apply.
+- Preserve finite remote ranking, neutral latency and US outcome history as soft ranking signals. Neutral TLS never proves eBay acceptance or clears local block/host cooldowns. Stable source labels include bounded coordinator provenance after a snapshot rotates.
+- One metadata worker owns coordinator, legacy and managed API updates. Main failover reads existing snapshots immediately, including while a source is slow. A cold start waits within the existing discovery budget for initial metadata; source failure never deletes an unexpired cache or disables other providers.
+- Coordinator snapshots contain at most 500 public endpoints, expire after at most 180 seconds, and retain the original retry backoff. Metadata refresh does not extend an old snapshot's expiry.
 
-- Refresh metadata about once per minute in the existing reserve worker. No new
-  threads, discovery concurrency changes, scan interval changes or extra eBay
-  checks are introduced.
-- Keep actual recent eBay successes first. Fresh coordinator endpoints get the
-  first half of replacement batches, while the existing backup providers can
-  occupy the remaining slots immediately under their existing conditions.
-- Immediate free standby reserves use at most two coordinator slots within the
-  existing free reserve budget. Remote neutral health never clears local eBay
-  block, transport failure, host cooldown or outage history.
-- Read at most 500 healthy, public, unauthenticated entries. Validate scheme,
-  global IP, port, source timestamp and market. Do not treat transport health as
-  proof that eBay accepts an address.
-- Expire metadata after at most 180 seconds. Failed refreshes retain the last
-  valid snapshot only until that original expiry; retries back off from 30 to
-  300 seconds. A background refresh never makes discovery wait on its lock.
-- Queue compact outcomes of existing real eBay requests. Send at most 64 reports
-  per batch; cap the queue at 128 and identity history at 1,000. Do not replay a
-  report after an ambiguous failure. No target-site requests are made by this
-  adapter, and responses/credentials are not retained in logs.
-- Legacy text downloads are capped at 2 MiB, checked for malformed entries and
-  closed explicitly. Preserve the original `PROXY_LIST` value.
+## Bounded speed and memory
 
-## Memory and rollback
+- Background neutral TLS preparation targets 16 independent ready IPs, or 20 during repeated rotations at RSS below 300 MB. Six TLS workers, batches up to 18 and memory safeguards remain in place. Stagger up to four rechecks within 30 seconds of expiry rather than let the whole reserve expire together. These checks do not request eBay pages.
+- Discovery ramps from 4 to 5 after 5 seconds and 6 after 8 seconds. At 18 seconds, eight probes are permitted only with RSS below 300 MB and at least 16 available independent IPs. A single global eight-probe limit includes unfinished earlier waves and handoff scouts, with no concurrent probe of the same IP. Fixed fetching and neutral TLS warming have their separate existing limits.
+- Keep at most one additional Session from an already successful concurrent probe, without its HTML. It expires after 35 seconds and is closed on quarantine, pause or memory pressure. Adoption requests and validates a fresh normal search response; old HTML is never returned. Metered Webshare is not retained as an extra spare.
+- Fixed-request timeouts shorten only after three measured successes and at least four local ready replacements. Floors are 10 seconds for normal reads and 6 seconds for recovery; unmeasured or slower endpoints keep their existing limits. A ready reserve skips a redundant recovery once the first failed request already took eight seconds.
+- Main fetching has priority over new auction reads of the shared Session; the existing Session lock remains in force. Parser, durable item state, continuity protection, database leader locks and notification rules remain intact.
 
-The existing parser, durable seen-item state, continuity protection, leader locks,
-memory guard, session recycling and all worker limits are unchanged. On a small
-Linux instance, `MALLOC_ARENA_MAX=2` can reduce allocator fragmentation; monitor
-memory and cadence after deployment, since this does not fix every native leak.
-It does not change Python worker counts.
+## Measurements and rollback
 
-Unset the two coordinator settings to disable only the integration. To roll back
-all code, deploy the preceding known-good revision through Render. Keep existing
-database and provider environment values intact.
+Every minute, bounded pipeline logs distinguish total intervals between successful main fetches from real network outages; they include p95 preparation/discovery/Session-lock time, actual request outcomes per source, fresh feed/TLS/known-good counts, active probes and spare count. No HTML, credentials or URLs are retained in this telemetry.
+
+Unset coordinator settings to disable only that integration. To revert this release, use Render rollback to v6.46 commit 78b4e025a7645f84c209e82a8860d1a19bb108e0. Keep database and provider secrets intact. The free hosting service can still have platform outages; application tuning is not a hosting availability guarantee.
 
 ## Offline checks
 
-Install `requirements.txt`, pytest and (on Windows) tzdata, then run
-`python -m pytest -q test_coordinator_feed.py`. Tests mock network operations and
-never contact production eBay, Telegram or the database. They cover outage/expiry,
-concurrent refresh, invalid data, bounded reporting, primary/backup selection,
-local cooldown precedence and managed provider safeguards.
+Install requirements.txt and pytest (plus tzdata on Windows), then run `python -m pytest -q test_coordinator_feed.py`. All tests mock external services and start no production workers. Coverage includes cache expiry/failure, metadata validation and ranking, feedback order and latency, ready-queue eligibility, source fallback, global concurrency and unique-IP limits, spare ownership/expiry/quarantine, fresh-response adoption, adaptive timeout floors, bounded telemetry and main/auction Session priority.
