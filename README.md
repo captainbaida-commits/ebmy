@@ -1,11 +1,11 @@
-# US eBay scanner: coordinator and fast failover (v6.47)
+# US eBay scanner: coordinator and fast failover (v6.47.1)
 
 The Blitz US feed is the preferred public pool. Existing PROXY_LIST, ProxyScrape Premium and Webshare remain independent backups. A working fixed Session stays in use. Store only the existing US feed token and coordinator HTTPS origin in Render Environment; credentials never belong in this repository.
 
 ## Selection and failover
 
 - Actual recent eBay successes stay first, including SOCKS5. An immediate standby candidate must have local TLS/TCP readiness or real success; remote neutral health alone does not consume a ready slot.
-- Fresh coordinator candidates normally receive about 75% of discovery/free standby slots, with an independent backup slot where available. After at least 12 actual discovery samples from each public group, this falls to 50% if coordinator success per second is clearly worse. Premium unlock, Webshare rescue delay, usage quotas and provider circuits still apply.
+- Fresh coordinator candidates normally receive about 75% of discovery/free standby slots, with an independent backup slot where available. After at least 12 actual discovery samples from each public group, this falls to 50% if coordinator success per second is clearly worse. Once at least 12 actual public discovery attempts show under 10% eBay acceptance, Premium fast-assist joins after 1.8 seconds/two attempts even if neutral TLS checks passed. Webshare rescue delay, usage quotas and provider circuits still apply. Fast rejections with zero actual successes cannot raise the coordinator share back to 75%.
 - Preserve finite remote ranking, neutral latency and US outcome history as soft ranking signals. Neutral TLS never proves eBay acceptance or clears local block/host cooldowns. Stable source labels include bounded coordinator provenance after a snapshot rotates.
 - One metadata worker owns coordinator, legacy and managed API updates. Main failover reads existing snapshots immediately, including while a source is slow. A cold start waits within the existing discovery budget for initial metadata; source failure never deletes an unexpired cache or disables other providers.
 - Coordinator snapshots contain at most 500 public endpoints, expire after at most 180 seconds, and retain the original retry backoff. Metadata refresh does not extend an old snapshot's expiry.
