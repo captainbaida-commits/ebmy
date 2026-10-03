@@ -6,8 +6,24 @@ from datetime import datetime, timezone
 from unittest.mock import Mock
 
 import pytest
+from concurrent.futures import Future, ThreadPoolExecutor
+from proxy_runtime import PipelineMetrics, ProbeLimiter, SpareSession, adaptive_timeout
 
 from coordinator_feed import CoordinatorFeed
+
+
+@pytest.fixture(autouse=True)
+def forbid_unmocked_network(monkeypatch):
+    import requests
+    import psycopg2
+    from curl_cffi import requests as curl_requests
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Offline test attempted an unmocked external operation')
+    monkeypatch.setattr(requests, 'get', forbidden)
+    monkeypatch.setattr(requests, 'post', forbidden)
+    monkeypatch.setattr(requests.Session, 'request', forbidden)
+    monkeypatch.setattr(curl_requests.Session, 'request', forbidden)
+    monkeypatch.setattr(psycopg2, 'connect', forbidden)
 
 
 def test_reserve_warming_prefers_fresh_coordinator_over_tcp_only(scanner):
@@ -313,7 +329,8 @@ def test_immediate_reserve_uses_primary_within_existing_budget(scanner):
     manager.proxies = primary + legacy
     manager.coordinator_current = frozenset(primary)
     manager.coordinator_valid_until = time.time() + 180
-    manager.quality_ok_until = {p: time.time() + 100 for p in legacy}
+    # Remote neutral health alone is not a locally ready TLS reserve.
+    manager.quality_ok_until = {p: time.time() + 100 for p in primary + legacy}
     reserve = manager.get_warm_standby_candidates(8)
     assert all(p in primary for p in reserve[:2])
     assert len(reserve) <= scanner.WARM_STANDBY_FREE_QUALITY_LIMIT
@@ -375,3 +392,289 @@ def test_feed_refill_does_not_discard_recent_working_proxy(scanner, feed, monkey
     assert proven in manager.proxies
     assert 'http://1.1.1.1:80' in manager.proxies
     assert 'http://8.8.8.8:8080' in manager.proxies
+
+
+def test_remote_metadata_is_finite_copied_and_expires(feed):
+    client, clock, transport = feed
+    transport.get.return_value = Response(payload(clock[0], [row(
+        score=17, neutral_latency_ms=450, market_quality=.82, market_failure_streak=1)]))
+    client.refresh()
+    uri = client.rows[0]
+    meta = client.metadata_snapshot()
+    assert meta[uri]['market_quality'] == .82 and meta[uri]['latency_ms'] == 450
+    meta[uri]['score'] = 999
+    assert client.metadata_snapshot()[uri]['score'] == 17
+    assert client.was_seen(uri)
+    clock[0] += 181
+    assert client.metadata_snapshot() == {} and client.was_seen(uri)
+
+
+def test_invalid_remote_numbers_never_poison_ranking(feed):
+    client, clock, transport = feed
+    transport.get.return_value = Response(payload(clock[0], [row(
+        score=float('nan'), neutral_latency_ms=float('inf'), market_quality='nonsense',
+        market_failure_streak=-100)]))
+    client.refresh()
+    meta = client.metadata_snapshot()[client.rows[0]]
+    assert meta['score'] == 0 and meta['latency_ms'] is None and meta['market_quality'] is None
+    assert meta['failure_streak'] == 0
+
+
+def test_feedback_uses_measured_latency_and_rejects_nan(feed):
+    client, clock, transport = feed
+    client.refresh()
+    uri = client.rows[0]
+    client.record_result(uri, 'success', latency_ms=1234.56)
+    client.record_result(uri, 'blocked', latency_ms=float('nan'))
+    clock[0] += 31
+    client.flush_feedback()
+    reports = transport.post.call_args.kwargs['json']['reports']
+    assert reports[0]['latency_ms'] == 1234.6
+    assert 'latency_ms' not in reports[1] and reports[1]['result'] == 'blocked'
+
+
+def test_unchecked_coordinator_does_not_consume_ready_reserve(scanner):
+    manager = scanner.ProxyManager()
+    primary = ['http://8.8.8.%d:80' % i for i in range(1, 4)]
+    ready = ['http://1.1.1.%d:80' % i for i in range(1, 9)]
+    manager.proxies = primary + ready
+    manager.coordinator_current = frozenset(primary)
+    manager.coordinator_valid_until = time.time() + 180
+    manager.quality_ok_until = {p: time.time() + 100 for p in ready}
+    selected = manager.get_warm_standby_candidates(8)
+    assert len(selected) == scanner.WARM_STANDBY_FREE_QUALITY_LIMIT
+    assert all(p in ready and manager.quality_state(p) == 'ok' for p in selected)
+
+
+def test_warm_reserve_real_socks_success_stays_first(scanner):
+    manager = scanner.ProxyManager()
+    proven = 'socks5://9.9.9.9:1080'
+    primary = ['http://8.8.8.%d:80' % i for i in range(1, 5)]
+    legacy = 'http://1.1.1.1:80'
+    manager.proxies = primary + [legacy, proven]
+    manager.last_success_at[proven] = time.time()
+    manager.coordinator_current = frozenset(primary)
+    manager.coordinator_valid_until = time.time() + 180
+    manager.quality_ok_until = {p: time.time() + 100 for p in primary + [legacy]}
+    selected = manager.get_warm_standby_candidates(8)
+    assert selected[0] == proven
+    assert legacy in selected and len(set(scanner._proxy_host(p) for p in selected)) == len(selected)
+
+
+def test_metadata_ranking_does_not_override_ebay_success(scanner):
+    manager = scanner.ProxyManager()
+    slow, fast, proven = 'http://8.8.8.1:80', 'http://8.8.8.2:80', 'socks5://9.9.9.9:1080'
+    manager.proxies = [slow, fast, proven]
+    manager.coordinator_current = frozenset([slow, fast])
+    manager.coordinator_valid_until = time.time() + 180
+    manager.coordinator_metadata = {slow: dict(rank=20, latency_ms=2500, failure_streak=2, market_quality=.2),
+                                    fast: dict(rank=0, latency_ms=200, failure_streak=0, market_quality=.9)}
+    assert manager.get_candidate_batch(1, allow_premium=False) == [fast]
+    manager.last_success_at[proven] = time.time()
+    assert manager.get_candidate_batch(1, allow_premium=False) == [proven]
+    manager.host_bad_until['8.8.8.2'] = time.time() + 300
+    assert fast not in manager.get_candidate_batch(4, allow_premium=False)
+
+
+def test_proactive_rechecks_do_not_starve_new_candidates(scanner):
+    manager = scanner.ProxyManager()
+    due = ['http://8.8.8.%d:80' % i for i in range(1, 10)]
+    fresh = ['http://1.1.1.%d:80' % i for i in range(1, 10)]
+    not_due = 'http://9.9.9.9:80'
+    manager.proxies = due + fresh + [not_due]
+    manager.quality_ok_until = {p: time.time() + 20 for p in due}
+    manager.quality_ok_until[not_due] = time.time() + 110
+    selected = manager.get_quality_preflight_candidates(8)
+    assert sum(p in due for p in selected) == 4
+    assert sum(p in fresh for p in selected) == 4
+    assert not_due not in selected
+
+
+def test_due_tls_recheck_performs_handshake_and_closes_socket(scanner, monkeypatch):
+    manager = scanner.ProxyManager()
+    proxy = 'http://8.8.8.8:80'
+    manager.quality_ok_until[proxy] = time.time() + 20
+    monkeypatch.setattr(scanner, 'proxy_manager', manager)
+    monkeypatch.setattr(scanner, '_tcp_preflight_proxy', lambda *a, **kw: (True, None))
+    tcp, tls = Mock(), Mock()
+    connect = Mock(return_value=tcp)
+    monkeypatch.setattr(scanner.socket, 'create_connection', connect)
+    monkeypatch.setattr(scanner, '_quality_recv_headers', lambda *a: b'HTTP/1.1 200 Connection established\r\n\r\n')
+    context = Mock()
+    context.wrap_socket.return_value = tls
+    monkeypatch.setattr(scanner.ssl, 'create_default_context', lambda: context)
+    assert scanner._quality_https_preflight_proxy(proxy) == (True, None)
+    connect.assert_not_called()
+    assert scanner._quality_https_preflight_proxy(proxy, force=True) == (True, None)
+    connect.assert_called_once()
+    tls.do_handshake.assert_called_once()
+    tls.close.assert_called_once()
+    assert manager.quality_ok_until[proxy] - time.time() > 100
+
+
+def test_limiter_covers_other_executor_and_same_ip_until_completion():
+    limiter = ProbeLimiter(2)
+    gate = threading.Event()
+    def block():
+        gate.wait(2)
+    with ThreadPoolExecutor(2) as first, ThreadPoolExecutor(2) as second:
+        a = limiter.submit(first, block, identity='first-ip')
+        assert limiter.submit(second, block, identity='first-ip') is None
+        b = limiter.submit(second, block, identity='second-ip')
+        assert limiter.count() == 2
+        assert limiter.submit(second, block, identity='third-ip') is None
+        gate.set()
+        a.result(2)
+        b.result(2)
+    assert limiter.count() == 0
+
+
+def test_limiter_releases_failed_submit_and_cancelled_queue():
+    limiter = ProbeLimiter(1)
+    executor = Mock()
+    executor.submit.side_effect = RuntimeError('shutdown')
+    with pytest.raises(RuntimeError):
+        limiter.submit(executor, lambda: None, identity='ip')
+    assert limiter.count() == 0
+    executor.submit.side_effect = None
+    queued = Future()
+    executor.submit.return_value = queued
+    limiter.submit(executor, lambda: None, identity='ip')
+    assert queued.cancel() and limiter.count() == 0
+    assert 'ip' not in limiter.identities
+
+
+def test_spare_is_single_owner_expiry_and_quarantine_close():
+    closed, now = [], [0]
+    slot = SpareSession(closed.append, clock=lambda: now[0])
+    one, two, three = object(), object(), object()
+    assert slot.offer('one', 'profile', one)
+    assert not slot.offer('two', 'profile', two)
+    assert slot.take(lambda p: True) == ('one', 'profile', one)
+    assert slot.take(lambda p: True) is None and closed == []
+    assert slot.offer('two', 'profile', two)
+    now[0] = 36
+    assert slot.take(lambda p: True) is None and closed == [two]
+    slot.offer('three', 'profile', three)
+    assert slot.take(lambda p: False) is None and closed == [two, three]
+
+
+def test_spare_expire_replacement_and_pressure_force_close():
+    closed, now = [], [0]
+    slot = SpareSession(closed.append, clock=lambda: now[0])
+    slot.offer('old', 'profile', 'session1')
+    slot.expire()
+    assert closed == []
+    now[0] = 36
+    slot.offer('new', 'profile', 'session2')
+    assert closed == ['session1']
+    slot.expire(force=True)
+    slot.expire(force=True)
+    assert closed == ['session1', 'session2'] and slot.count() == 0
+
+
+@pytest.mark.parametrize('ready,p95,recovery,expected', [
+    (3, 1, False, (6, 18)), (8, None, False, (6, 18)),
+    (8, 1, False, (3.5, 10)), (8, 7, False, (6, 18)),
+    (8, 1, True, (3.5, 6)),
+])
+def test_adaptive_timeout_has_sample_and_reserve_floors(ready, p95, recovery, expected):
+    assert adaptive_timeout((6, 18), p95, ready, recovery) == expected
+
+
+def test_metrics_require_evidence_bound_memory_and_measure_outage_separately():
+    now = [1000]
+    metrics = PipelineMetrics(clock=lambda: now[0])
+    for _ in range(3):
+        metrics.record_request('p', 'coordinator', 'success', 1.5, 'fixed')
+    assert metrics.successful_latency('p') == 1.5
+    assert metrics.coordinator_fraction() == .75
+    for _ in range(12):
+        metrics.record_request('a', 'coordinator', 'blocked', 4, 'discovery')
+        metrics.record_request('b', 'legacy', 'success', 1, 'discovery')
+    assert metrics.coordinator_fraction() == .5
+    metrics.success()
+    now[0] += 15
+    metrics.success(outage=3)
+    snap = metrics.snapshot_if_due()
+    assert snap['gap_p95'] == 15 and snap['outage_p95'] == 3
+    for i in range(1500):
+        metrics.record_request(str(i), 'legacy', 'success', 1, 'discovery')
+    assert len(metrics.latencies) == 1000 and len(metrics.requests) == 512
+    now[0] += 1000
+    assert metrics.coordinator_fraction() == .75
+
+
+def test_main_priority_clears_even_on_exception(scanner, monkeypatch):
+    monkeypatch.setattr(scanner, '_fetch_ebay_html_with_fixed_pair_impl', Mock(side_effect=RuntimeError('offline')))
+    with pytest.raises(RuntimeError):
+        scanner.fetch_ebay_html_with_fixed_pair()
+    assert not scanner.main_request_pending.is_set()
+
+
+def test_pending_main_prevents_auction_using_session(scanner, monkeypatch):
+    pending = threading.Event()
+    pending.set()
+    session = Mock()
+    monkeypatch.setattr(scanner, 'main_request_pending', pending)
+    monkeypatch.setattr(scanner, 'fixed_session', session)
+    assert scanner._request_auction_via_main_session('https://test.example')[2] == 'main_busy'
+    session.get.assert_not_called()
+
+
+def test_hot_failover_uses_ready_queue_without_source_api(scanner, monkeypatch):
+    manager = scanner.ProxyManager()
+    old, good = 'http://8.8.8.8:80', 'socks5://1.1.1.1:1080'
+    manager.proxies = manager.all_proxies = [good]
+    manager.last_refresh = time.time()
+    manager.last_success_at[good] = time.time()
+    monkeypatch.setattr(scanner, 'proxy_manager', manager)
+    monkeypatch.setattr(scanner, 'fixed_proxy', old)
+    monkeypatch.setattr(scanner, 'fixed_profile', {'name': 'test'})
+    monkeypatch.setattr(scanner, 'fixed_session', Mock())
+    monkeypatch.setattr(scanner, 'pipeline_metrics', PipelineMetrics())
+    limiter = ProbeLimiter(8)
+    monkeypatch.setattr(scanner, 'probe_limiter', limiter)
+    monkeypatch.setattr(scanner, 'spare_session', SpareSession(scanner.close_session))
+    monkeypatch.setattr(scanner, '_adopt_webshare_handoff_if_ready', lambda: None)
+    monkeypatch.setattr(scanner, '_memory_rss_mb', lambda: 100)
+    monkeypatch.setattr(scanner, '_memory_maintenance', lambda *a, **kw: None)
+    monkeypatch.setattr(scanner, 'get_preferred_profile', lambda: {'name': 'test'})
+    monkeypatch.setattr(scanner, '_tcp_preflight_proxy', lambda *a, **kw: (True, None))
+    monkeypatch.setattr(scanner, '_consume_restart_sticky_candidate', lambda: None)
+    monkeypatch.setattr(scanner, '_queue_restart_sticky_persist', lambda *a, **kw: None)
+    monkeypatch.setattr(scanner, 'wake_queued_auctions_for_new_fixed', lambda: None)
+    monkeypatch.setattr(scanner, 'record_ebay_success', lambda: None)
+    for method in ('refresh_proxies', 'refresh_standard_merge', 'refresh_deep_emergency', 'refresh_coordinator'):
+        monkeypatch.setattr(manager, method, Mock(side_effect=AssertionError('source API on hot path')))
+    monkeypatch.setattr(scanner.provider_manager, 'refresh_all', Mock(side_effect=AssertionError('managed API on hot path')))
+    request = Mock(side_effect=lambda p, *a, **kw: ('blocked', None, kw.get('session')) if p == old
+                   else ('success', 'fresh search response', Mock()))
+    monkeypatch.setattr(scanner, '_make_request', request)
+    assert scanner.fetch_ebay_html_with_fixed_pair() == 'fresh search response'
+    assert scanner.fixed_proxy == good
+    assert request.call_count == 2 and limiter.count() == 0
+    assert not scanner.main_request_pending.is_set()
+
+
+@pytest.mark.parametrize('result', ['success', 'blocked'])
+def test_spare_adoption_requires_fresh_validated_response(scanner, monkeypatch, result):
+    manager = scanner.ProxyManager()
+    slot = SpareSession(scanner.close_session)
+    session = Mock()
+    proxy = 'http://8.8.8.8:80'
+    slot.offer(proxy, {'name': 'test'}, session)
+    monkeypatch.setattr(scanner, 'proxy_manager', manager)
+    monkeypatch.setattr(scanner, 'spare_session', slot)
+    monkeypatch.setattr(scanner, '_spare_proxy_eligible', lambda p: True)
+    monkeypatch.setattr(scanner, '_make_request', lambda *a, **kw: (result, 'NEW response' if result == 'success' else None, session))
+    monkeypatch.setattr(scanner, 'record_ebay_success', lambda: None)
+    monkeypatch.setattr(scanner, '_queue_restart_sticky_persist', lambda *a, **kw: None)
+    monkeypatch.setattr(scanner, 'wake_queued_auctions_for_new_fixed', lambda: None)
+    assert scanner._adopt_spare_session() == ('NEW response' if result == 'success' else None)
+    assert slot.count() == 0
+    if result == 'blocked':
+        session.close.assert_called_once()
+        assert manager.host_bad_until['8.8.8.8'] > time.time()
+    else:
+        session.close.assert_not_called()
