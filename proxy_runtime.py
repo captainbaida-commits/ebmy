@@ -156,12 +156,24 @@ class PipelineMetrics:
         groups = {name: [r for r in rows if r[1] == name] for name in ('coordinator', 'legacy')}
         if min(map(len, groups.values())) < 12:
             return .75
+        # Fast 403s are not useful throughput. A pseudocount must never promote a
+        # repeatedly rejected feed above a group with actual successful responses.
+        if not any(r[2] == 'success' for r in groups['coordinator']):
+            return .5
         def utility(rows):
             success = sum(r[2] == 'success' for r in rows)
             probability = (success + 2) / (len(rows) + 8)
             cost = max(.4, sum(r[3] for r in rows) / len(rows))
             return probability / cost
         return .5 if utility(groups['coordinator']) < .7 * utility(groups['legacy']) else .75
+
+    def public_acceptance(self):
+        with self.lock:
+            rows = [r for r in self.requests if self.clock() - r[0] < 900
+                    and r[1] in ('coordinator', 'legacy') and r[4] == 'discovery']
+        if len(rows) < 12:
+            return None
+        return sum(r[2] == 'success' for r in rows) / len(rows)
 
     def snapshot_if_due(self, interval=60):
         with self.lock:
