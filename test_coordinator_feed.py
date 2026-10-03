@@ -10,6 +10,60 @@ import pytest
 from coordinator_feed import CoordinatorFeed
 
 
+def test_reserve_warming_prefers_fresh_coordinator_over_tcp_only(scanner):
+    manager = scanner.ProxyManager()
+    primary = 'http://8.8.8.8:8080'
+    tcp_only = 'http://1.1.1.1:80'
+    manager.proxies = [tcp_only, primary]
+    manager.coordinator_current = frozenset([primary])
+    manager.coordinator_valid_until = time.time() + 120
+    manager.preflight_ok_until[tcp_only] = time.time() + 60
+    assert manager.get_quality_preflight_candidates(1) == [primary]
+    assert primary not in manager.quality_ok_until
+    assert primary not in manager.last_success_at
+
+
+def test_reserve_warming_keeps_real_success_first(scanner):
+    manager = scanner.ProxyManager()
+    primary = 'http://8.8.8.8:8080'
+    proven = 'http://1.1.1.1:80'
+    manager.proxies = [primary, proven]
+    manager.coordinator_current = frozenset([primary])
+    manager.coordinator_valid_until = time.time() + 120
+    manager.last_success_at[proven] = time.time()
+    assert manager.get_quality_preflight_candidates(1) == [proven]
+
+
+def test_reserve_warming_expired_feed_keeps_legacy_tcp_priority(scanner):
+    manager = scanner.ProxyManager()
+    primary = 'http://8.8.8.8:8080'
+    tcp_only = 'http://1.1.1.1:80'
+    manager.proxies = [primary, tcp_only]
+    manager.coordinator_current = frozenset([primary])
+    manager.coordinator_valid_until = time.time() - 1
+    manager.preflight_ok_until[tcp_only] = time.time() + 60
+    assert manager.get_quality_preflight_candidates(1) == [tcp_only]
+
+
+def test_reserve_warming_respects_quarantine_and_host_diversity(scanner, monkeypatch):
+    manager = scanner.ProxyManager()
+    blocked = 'http://8.8.8.8:8080'
+    tls_bad = 'http://8.8.4.4:8080'
+    managed = 'http://1.1.1.1:8080'
+    twins = ['http://9.9.9.9:80', 'socks5://9.9.9.9:1080']
+    legacy = 'http://4.2.2.2:8080'
+    manager.proxies = [blocked, tls_bad, managed] + twins + [legacy]
+    manager.coordinator_current = frozenset(manager.proxies)
+    manager.coordinator_valid_until = time.time() + 120
+    manager.host_bad_until['8.8.8.8'] = time.time() + 300
+    manager.quality_bad_until[tls_bad] = time.time() + 45
+    monkeypatch.setattr(scanner.provider_manager, 'source_fast', lambda p: 'webshare' if p == managed else 'free')
+    selected = manager.get_quality_preflight_candidates(12)
+    assert len(selected) == 2 and legacy in selected
+    assert sum(p in twins for p in selected) == 1
+    assert not any(p in selected for p in (blocked, tls_bad, managed))
+
+
 class Response:
     def __init__(self, data=None, status=200, raw=None):
         self.status_code = status
