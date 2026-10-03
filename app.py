@@ -379,18 +379,15 @@ PROXY_QUALITY_TIMEOUT = max(1.2, min(float(os.getenv("PROXY_QUALITY_TIMEOUT", "3
 PROXY_QUALITY_OK_TTL = max(60, int(os.getenv("PROXY_QUALITY_OK_TTL", "120")))
 PROXY_QUALITY_BAD_TTL = max(20, int(os.getenv("PROXY_QUALITY_BAD_TTL", "45")))
 
-# v6.20 за ~53 минуты сделал ~1684 neutral quality-checks; при этом для быстрого failover
-# реально достаточно короткой первой wave из 4 verified-free. Поэтому держим ~8 свежих
-# HTTPS-capable резервов, а не 12+, и уменьшаем тяжёлый background batch без потери fallback.
-PROXY_PREFLIGHT_WARM_BATCH = max(4, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "12")), 24))
-# V6.26 AdaptiveFast: keep the same reserve depth, but limit simultaneous TLS handshakes.
-# This does NOT slow the 15-27 second main eBay checks; it only lowers background peak RAM.
+# V6.46: replenish the often-empty neutral TLS reserve while RAM has measured headroom.
+# These checks use public FREE proxies only, never extra eBay requests or managed traffic.
+PROXY_PREFLIGHT_WARM_BATCH = max(4, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "18")), 24))
 PROXY_PREFLIGHT_WARM_CONCURRENCY = max(
-    2, min(int(os.getenv("PROXY_PREFLIGHT_WARM_CONCURRENCY", "4")), 6)
+    2, min(int(os.getenv("PROXY_PREFLIGHT_WARM_CONCURRENCY", "6")), 6)
 )
-PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "20")))
+PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "15")))
 PROXY_PREFLIGHT_RESERVE_TARGET = max(
-    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "8")), 24)
+    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "12")), 24)
 )
 PROXY_PREFLIGHT_MAINTENANCE_BATCH = max(
     2, min(int(os.getenv("PROXY_PREFLIGHT_MAINTENANCE_BATCH", "4")), 8)
@@ -2931,9 +2928,15 @@ class ProxyManager:
                     continue
                 rows.append(p)
 
-            # TCP-open идёт первым, затем ещё неизвестные; внутри — обычный score.
+            # Real eBay success remains strongest. Fresh coordinator candidates already
+            # passed remote neutral checks, so warm them before legacy TCP-only rows.
+            # Still perform our OWN TLS check; never clear local bad/host cooldowns.
             rows.sort(
                 key=lambda p: (
+                    1 if (self._is_recent_good_locked(p, now)
+                          and self.fail_streak.get(p, 0) <= 2
+                          and self.last_failure_result.get(p) in (None, 'proxy_timeout', 'proxy_error')) else 0,
+                    1 if self.is_coordinator_proxy_fast(p, now) else 0,
                     1 if self._preflight_state_locked(p, now) == 'ok' else 0,
                     self._candidate_score_locked(p, now),
                 ),
@@ -12685,7 +12688,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.45 COORDINATOR-FIRST работает." +
+        "\n🇺🇸 eBay США monitor v6.46 RESERVE-READY работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -12802,7 +12805,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.45 COORDINATOR-FIRST: "
+        "🌐 Multi-provider v6.46 RESERVE-READY: "
         f"Blitz US={'ON' if coordinator_feed.enabled else 'OFF'}, legacy reserve=ON, "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
@@ -12897,7 +12900,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.45 CoordinatorFirst, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.46 ReserveReady, {role})"
 
 
 @app.route('/health')
