@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from unittest.mock import Mock
 
 import pytest
+from runtime_guard import RuntimeGuard
 from concurrent.futures import Future, ThreadPoolExecutor
 from proxy_runtime import PipelineMetrics, ProbeLimiter, SpareSession, adaptive_timeout
 
@@ -281,6 +282,75 @@ def scanner(monkeypatch):
     monkeypatch.setattr(app.provider_manager, 'candidates', lambda **kwargs: [])
     monkeypatch.setattr(app.provider_manager, 'source_fast', lambda p: 'free')
     return app
+
+
+def test_health_detects_stopped_main_and_preserves_proxy_outage_health(scanner, monkeypatch):
+    from unittest.mock import Mock
+    guard = RuntimeGuard(clock=lambda: 1000)
+    worker = Mock(name='worker')
+    worker.name = 'main-ebay-worker'
+    worker.is_alive.return_value = True
+    guard.register(worker, timeout=300)
+    guard.workers[worker.name][1] = 0
+    guard.workers[worker.name][2] = 999
+    monkeypatch.setattr(scanner, 'runtime_guard', guard)
+    assert scanner.health() == ('OK', 200)
+    guard.workers[worker.name][2] = 0
+    assert scanner.health() == ('RECOVERING', 503)
+    guard.set_paused(True)
+    assert scanner.health() == ('OK', 200)
+    worker.is_alive.return_value = False
+    assert scanner.health() == ('RECOVERING', 503)
+
+
+def test_cold_start_snapshot_failure_retries_instead_of_killing_main(scanner, monkeypatch):
+    class Finished(BaseException):
+        pass
+    monkeypatch.setattr(scanner, 'db_ready_event', threading.Event())
+    scanner.db_ready_event.set()
+    monkeypatch.setattr(scanner, 'is_db_empty', lambda: True)
+    snapshot = Mock(side_effect=[False, False, True])
+    monkeypatch.setattr(scanner, 'perform_initial_snapshot', snapshot)
+    monkeypatch.setattr(scanner, 'get_seen_count_cached', lambda: 60)
+    monkeypatch.setattr(scanner, 'send_telegram_message', Mock(return_value=True))
+    monkeypatch.setattr(scanner, 'is_paused', False)
+    monkeypatch.setattr(scanner.time, 'sleep', lambda delay: None)
+    monkeypatch.setattr(scanner, 'check_and_send_new_items', Mock(side_effect=Finished))
+    with pytest.raises(Finished):
+        scanner.bot_worker()
+    assert snapshot.call_count == 3
+
+
+def test_blocked_host_logging_does_not_hold_proxy_manager_lock(scanner, monkeypatch):
+    import logging
+    from async_logging import BoundedLogHandler
+    entered, release = threading.Event(), threading.Event()
+    class Stream:
+        def write(self, value):
+            entered.set()
+            release.wait(3)
+        def flush(self):
+            pass
+    handler = BoundedLogHandler(Stream(), capacity=2)
+    monkeypatch.setattr(logging.getLogger(), 'handlers', [handler])
+    monkeypatch.setattr(logging.getLogger(), 'level', logging.INFO)
+    manager = scanner.ProxyManager()
+    proxy = 'http://8.8.8.8:8080'
+    try:
+        logging.warning('deliberately blocked test sink')
+        assert entered.wait(1)
+        done = threading.Event()
+        def mark_failure():
+            manager.mark_failure(proxy, 'blocked', reason='offline regression')
+            done.set()
+        thread = threading.Thread(target=mark_failure, daemon=True)
+        thread.start()
+        assert done.wait(1), 'proxy worker waited for hosting log output'
+        assert manager.lock.acquire(timeout=.2)
+        manager.lock.release()
+        thread.join(timeout=1)
+    finally:
+        release.set()
 
 
 def test_coordinator_merge_preserves_legacy_and_local_ebay_cooldown(scanner, feed, monkeypatch):
