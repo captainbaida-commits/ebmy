@@ -1,4 +1,4 @@
-# US eBay scanner: coordinator and fast failover (v6.47.1)
+# US eBay scanner: coordinator and fast failover (v6.48)
 
 The Blitz US feed is the preferred public pool. Existing PROXY_LIST, ProxyScrape Premium and Webshare remain independent backups. A working fixed Session stays in use. Store only the existing US feed token and coordinator HTTPS origin in Render Environment; credentials never belong in this repository.
 
@@ -27,3 +27,13 @@ Unset coordinator settings to disable only that integration. To revert this rele
 ## Offline checks
 
 Install requirements.txt and pytest (plus tzdata on Windows), then run `python -m pytest -q test_coordinator_feed.py`. All tests mock external services and start no production workers. Coverage includes cache expiry/failure, metadata validation and ranking, feedback order and latency, ready-queue eligibility, source fallback, global concurrency and unique-IP limits, spare ownership/expiry/quarantine, fresh-response adoption, adaptive timeout floors, bounded telemetry and main/auction Session priority.
+
+## Process recovery (v6.48)
+
+Render Start Command: `python -u runtime_supervisor.py`. Set Render Health Check Path and the external five-minute monitor to `/health`. The independent stdlib supervisor replaces an unresponsive child after 120 seconds without its heartbeat (180 seconds for initial startup), or after 300 seconds without main-worker control-flow progress. Two consecutive bad checks are required. It stops and reaps the old child before starting a replacement, preserves the last reported manual pause, and keeps the PostgreSQL leader lock for overlap between deployments. Three recoveries within ten minutes trigger a 60-second backoff.
+
+Normal failed proxy probes, a long eBay outage with continuing attempts, an intentional `/stop`, and a healthy standby instance do not trigger recovery. Main discovery and individual new-item notifications report progress, so a large notification burst is not mistaken for a freeze. A cold initial snapshot retries rather than permanently ending its worker. `/health` returns 503 for a dead/stuck registered worker, while ordinary provider outages still return 200.
+
+A bounded asynchronous log queue (256 strings, at most 4096 characters each) prevents a blocked hosting log collector from holding proxy-manager locks. Under a prolonged blocked collector, excess log entries are dropped to keep scanning and RAM bounded. The supervisor's RSS is included in the existing memory safeguards. Credentials and durable data remain in the original environment/PostgreSQL; the heartbeat contains only worker status and fixed stage names.
+
+Run `python -m pytest -q` for regression checks, including local fake-process freeze recovery, pause preservation, obsolete-heartbeat rejection, health status, cold-start retries and blocked-log fault injection. A POSIX-only SIGTERM-to-SIGKILL check is skipped on Windows. Rollback: restore the preceding commit and `python app.py` as the Render Start Command together. Platform-wide suspension or outages cannot be repaired from inside the suspended service.
