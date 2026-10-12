@@ -17,6 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import requests
 from coordinator_feed import CoordinatorFeed
 from proxy_runtime import PipelineMetrics, ProbeLimiter, SpareSession, adaptive_timeout
+from runtime_guard import runtime_guard, stalled_worker, supervisor_rss_mb, MAIN_STALL_SECONDS
+from async_logging import configure_logging
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
@@ -751,7 +753,7 @@ if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
-is_paused = False
+is_paused = runtime_guard.paused
 
 # Telegram listener сохраняет auction-ссылку в PostgreSQL и сразу возвращается к getUpdates.
 # Тяжёлое получение страницы eBay выполняется отдельным ОДНИМ worker'ом. Если proxy
@@ -809,7 +811,7 @@ def _memory_rss_mb():
                 if line.startswith('VmRSS:'):
                     parts = line.split()
                     if len(parts) >= 2:
-                        return float(parts[1]) / 1024.0
+                        return float(parts[1]) / 1024.0 + supervisor_rss_mb()
     except Exception:
         return None
     return None
@@ -9305,6 +9307,7 @@ def telegram_listener():
                             text = message.get('text', '').strip()
                             if text == '/stop':
                                 is_paused = True
+                                runtime_guard.set_paused(True)
                                 send_telegram_message(
                                     "⏸ Основной мониторинг новых товаров приостановлен. "
                                     "Напоминания об уже сохранённых аукционах продолжают работать. "
@@ -9313,6 +9316,7 @@ def telegram_listener():
                                 logging.info("Команда /stop - пауза основного мониторинга")
                             elif text == '/start':
                                 is_paused = False
+                                runtime_guard.set_paused(False)
                                 reset_connection_watch_after_manual_resume()
                                 send_telegram_message(
                                     "▶ Основной мониторинг продолжает работу",
@@ -11008,6 +11012,7 @@ def _fetch_ebay_html_with_fixed_pair_impl():
     try:
         submit_more()
         while True:
+            runtime_guard.progress('main-ebay-worker', 'proxy discovery')
             elapsed = time.monotonic() - started
             if elapsed >= SEARCH_TIME_BUDGET:
                 logging.warning(
@@ -12626,12 +12631,15 @@ def _build_new_item_message(item):
 def check_and_send_new_items():
     current = None
     for parse_attempt in range(2):
+        runtime_guard.progress('main-ebay-worker', 'fetch search page')
         html = fetch_ebay_html_with_retry()
         if not html:
             logging.warning("Не удалось загрузить страницу, проверка пропущена")
             return 'fetch_error'
 
+        runtime_guard.progress('main-ebay-worker', 'parse search page')
         current = parse_ebay_listings(html)
+        runtime_guard.progress('main-ebay-worker', 'store new item IDs')
 
         # V6.37: один редкий, строго ограниченный rescue для HTTP-200 thin shell.
         # Production case: ~149 KB HTML, title='cross stitch kit | eBay', SRP root есть,
@@ -12689,6 +12697,7 @@ def check_and_send_new_items():
     )
 
     for idx, (item_id, data) in enumerate(claimed_items, start=1):
+        runtime_guard.progress('main-ebay-worker', 'verify and notify new item')
         before_verify = {'price': data.get('price'), 'shipping': data.get('shipping')}
         item = {'id': item_id, **data}
         item = _verify_new_item_price_shipping(item, deadline_monotonic=verify_deadline)
@@ -12920,6 +12929,7 @@ def bot_worker():
     logging.info("🤖 Бот-воркер запущен")
     db_ready_event.wait()
     while True:
+        runtime_guard.progress('main-ebay-worker', 'initialize database state')
         try:
             db_empty = is_db_empty()
             break
@@ -12931,9 +12941,12 @@ def bot_worker():
             time.sleep(DB_MAIN_RETRY_WAIT)
 
     if db_empty:
-        if not perform_initial_snapshot():
-            send_telegram_message("❌ Ошибка инициализации")
-            return
+        # A cold database plus temporarily bad proxies must not permanently end
+        # the main daemon while Flask continues returning HTTP 200.
+        while not perform_initial_snapshot():
+            runtime_guard.progress('main-ebay-worker', 'initial snapshot retry')
+            logging.warning('Начальный снимок пока недоступен; повтор через 5 сек.')
+            time.sleep(5)
         startup_line = "✅ Бот запущен, начальный снимок сделан"
     else:
         startup_line = "✅ Бот запущен / перезапущен"
@@ -12942,7 +12955,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇺🇸 eBay США monitor v6.47.1 FAST-FAILOVER работает." +
+        "\n🇺🇸 eBay США monitor v6.48 FAST-FAILOVER работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -12953,6 +12966,7 @@ def bot_worker():
     parse_error_streak = 0
 
     while True:
+        runtime_guard.progress('main-ebay-worker', 'paused' if is_paused else 'begin main cycle')
         if is_paused:
             time.sleep(2)
             continue
@@ -12962,6 +12976,7 @@ def bot_worker():
             result = check_and_send_new_items()
             cycle_elapsed = time.monotonic() - cycle_started
             cadence_mode, cadence_reasons = adaptive_finish_main_cycle(result)
+            runtime_guard.progress('main-ebay-worker', 'main cycle completed')
 
             if result == 'ok':
                 parse_error_proxy_key = None
@@ -13042,7 +13057,9 @@ def bot_worker():
 
 def start_leader_workers():
     """Инициализирует БД и запускает фоновые задачи только в leader-instance."""
+    runtime_guard.progress('leader-supervisor', 'initialize database')
     init_db()
+    runtime_guard.progress('leader-supervisor', 'restore durable state')
     initialize_seen_count_cache()
     # Durable auction rows live in PostgreSQL. Recovery acceleration is an optimization:
     # if this diagnostics UPDATE happens to fail during a brief Aiven hiccup, do NOT block
@@ -13059,7 +13076,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.47.1 FAST-FAILOVER: "
+        "🌐 Multi-provider v6.48 FAST-FAILOVER: "
         f"Blitz US={'ON' if coordinator_feed.enabled else 'OFF'}, legacy reserve=ON, "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
@@ -13106,24 +13123,36 @@ def start_leader_workers():
             "Для режима 10-14/10-18/10-22 установите CHECK_INTERVAL=10 в Render."
         )
 
+    runtime_guard.progress('leader-supervisor', 'configure Telegram')
     configure_telegram_bot_ui()
-    threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
-    threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
-    threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
-    threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
-    threading.Thread(target=proxy_metadata_worker, daemon=True, name='proxy-metadata-worker').start()
-    threading.Thread(target=proxy_preflight_warm_worker, daemon=True, name='proxy-preflight-worker').start()
-    threading.Thread(target=webshare_handoff_worker, daemon=True, name='webshare-handoff-worker').start()
-    threading.Thread(target=auction_link_worker, daemon=True, name='auction-link-worker').start()
-    threading.Thread(target=auction_reminder_worker, daemon=True, name='auction-reminder-worker').start()
-    threading.Thread(target=auction_status_worker, daemon=True, name='auction-status-worker').start()
-    threading.Thread(target=bot_worker, daemon=True, name='main-ebay-worker').start()
+    workers = [
+        (telegram_listener, 'telegram-listener'),
+        (connection_watchdog, 'connection-watchdog'),
+        (memory_guard_worker, 'memory-guard-worker'),
+        (restart_sticky_persist_worker, 'restart-sticky-persist'),
+        (proxy_metadata_worker, 'proxy-metadata-worker'),
+        (proxy_preflight_warm_worker, 'proxy-preflight-worker'),
+        (webshare_handoff_worker, 'webshare-handoff-worker'),
+        (auction_link_worker, 'auction-link-worker'),
+        (auction_reminder_worker, 'auction-reminder-worker'),
+        (auction_status_worker, 'auction-status-worker'),
+        (bot_worker, 'main-ebay-worker'),
+    ]
+    for target, name in workers:
+        thread = threading.Thread(target=target, daemon=True, name=name)
+        if target is not memory_guard_worker or MEMORY_GUARD_ENABLED:
+            runtime_guard.register(thread, MAIN_STALL_SECONDS if target is bot_worker else 0)
+        thread.start()
+    runtime_guard.mode = 'leader'
+    logging.info('🛡 Runtime guard active: independent supervisor=%s; main stall=%ss; bounded async logs',
+                 bool(os.getenv('SCANNER_GUARD_NONCE')), MAIN_STALL_SECONDS)
 
 
 def leader_supervisor():
     """Не даёт двум Render instances одновременно запускать Telegram/eBay workers."""
     last_standby_log = 0.0
     while True:
+        runtime_guard.progress('leader-supervisor', 'acquire leader lock')
         conn = try_acquire_leader_lock()
         if conn is None:
             now = time.monotonic()
@@ -13139,6 +13168,7 @@ def leader_supervisor():
             # Если оно умерло, PostgreSQL сам освободит lock. Чтобы старая копия
             # не продолжала workers без lock, завершаем процесс — Render его перезапустит.
             while True:
+                runtime_guard.progress('leader-supervisor', 'leader database heartbeat')
                 time.sleep(LEADER_HEALTH_INTERVAL)
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
@@ -13155,19 +13185,27 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (США, adaptive parallel US v6.47.1 FastFailover, {role})"
+    return f"eBay бот работает (США, adaptive parallel US v6.48 RuntimeGuard, {role})"
 
 
 @app.route('/health')
 def health():
-    # /health намеренно не зависит от eBay/proxy/Aiven: UptimeRobot должен держать
-    # Render Web Service активным даже во время временного сбоя внешних сервисов.
-    return "OK", 200
+    # Failed proxies and intentional pause remain healthy. A stopped/stuck
+    # worker must no longer look healthy merely because Flask still answers.
+    reason = stalled_worker(runtime_guard.snapshot())
+    return ("RECOVERING", 503) if reason else ("OK", 200)
 
 
 if __name__ == "__main__":
+    configure_logging()
+    runtime_guard.start()
+    recovery_reason = os.getenv('SCANNER_RECOVERY_REASON')
+    if recovery_reason:
+        logging.warning('🛡 Runtime supervisor recovered scanner: %s; paused=%s', recovery_reason, is_paused)
     # Flask привязывается к PORT сразу, чтобы новый Render instance прошёл health/port check.
     # Фоновые задачи стартуют только после получения PostgreSQL leader-lock.
-    threading.Thread(target=leader_supervisor, daemon=True, name='leader-supervisor').start()
+    leader_thread = threading.Thread(target=leader_supervisor, daemon=True, name='leader-supervisor')
+    runtime_guard.register(leader_thread, timeout=180)
+    leader_thread.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
