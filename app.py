@@ -112,6 +112,11 @@ SEARCH_CONTINUITY_COLD_CONFIRM_OVERLAP = max(
     0.60, min(float(os.getenv("SEARCH_CONTINUITY_COLD_CONFIRM_OVERLAP", "0.75")), 0.95)
 )
 SEARCH_CONTINUITY_WARN_INTERVAL = max(10.0, float(os.getenv("SEARCH_CONTINUITY_WARN_INTERVAL", "30")))
+# A trusted top page can become obsolete during a long outage or a transient A/B
+# response. Require repeated, matching main-search pages before replacing it.
+SEARCH_CONTINUITY_RECONFIRMATIONS = 3
+SEARCH_CONTINUITY_RECONFIRM_WINDOW = 300.0
+SEARCH_CONTINUITY_RECONFIRM_MIN_AGE = 20.0
 
 # V6.37 SEARCH-SOFT-SHELL GUARD.
 # eBay can answer HTTP 200 with a very small JS/client shell that contains the main SRP
@@ -1045,6 +1050,9 @@ search_continuity_last_warn = 0.0
 search_continuity_cold_candidate_ids = set()
 search_continuity_cold_candidate_count = 0
 search_continuity_cold_candidate_started = 0.0
+search_continuity_reconfirm_ids = set()
+search_continuity_reconfirm_count = 0
+search_continuity_reconfirm_started = None
 
 
 def adaptive_begin_main_cycle():
@@ -12305,6 +12313,15 @@ def _parse_anchor_only_fallback(html, max_items=MAX_ITEMS):
             except Exception:
                 pass
 
+def _search_page_matches_configured_query(html):
+    """Allow continuity recovery only for a titled page of the configured search."""
+    keywords = dict(parse_qsl(urlsplit(EBAY_SEARCH_URL).query)).get('_nkw', '')
+    normalize = lambda value: ' '.join(re.findall(r'\w+', html_lib.unescape(value).casefold()))
+    expected = normalize(keywords)
+    title = normalize(_search_html_title(html) or '')
+    return bool(expected and f' {expected} ' in f' {title} ' and 'ebay' in title.split())
+
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return None
@@ -12324,6 +12341,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             # enough to keep new-item detection alive.
             return _parse_anchor_only_fallback(html, max_items=max_items)
 
+        rebase_safe = parse_mode in ('root', 'full') and _search_page_matches_configured_query(html)
         items = {}
         for card in cards:
             if len(items) >= max_items:
@@ -12380,6 +12398,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
                 'auction': auction,
                 'has_buy_it_now': has_bin,
                 'buy_it_now_price': bin_price,
+                '_continuity_rebase_safe': rebase_safe,
             }
 
         # Rootless card-only mode is intentionally strict. Recommendation carousels
@@ -12409,7 +12428,14 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
                 pass
 
 
-def _search_continuity_accept(current_ids):
+def _clear_search_reconfirmation_locked():
+    global search_continuity_reconfirm_count, search_continuity_reconfirm_started
+    search_continuity_reconfirm_ids.clear()
+    search_continuity_reconfirm_count = 0
+    search_continuity_reconfirm_started = None
+
+
+def _search_continuity_accept(current_ids, allow_reconfirm=False):
     """Return True only for a result set continuous with the last trusted top page.
 
     Normal newest-sort movement (1-15 new IDs) has huge overlap and passes immediately.
@@ -12417,10 +12443,12 @@ def _search_continuity_accept(current_ids):
     seen_items is mutated, preventing a 60-message false burst.
     """
     global search_continuity_trusted_ids, search_continuity_last_warn
+    global search_continuity_reconfirm_count, search_continuity_reconfirm_started
     ids = {str(x) for x in current_ids if x}
     if not SEARCH_CONTINUITY_GUARD_ENABLED or not ids:
         with search_continuity_lock:
             search_continuity_trusted_ids = set(ids)
+            _clear_search_reconfirmation_locked()
         return True
 
     with search_continuity_lock:
@@ -12501,20 +12529,52 @@ def _search_continuity_accept(current_ids):
         if overlap_ratio < SEARCH_CONTINUITY_MIN_OVERLAP:
             adaptive_mark_main_issue(1, 'search_result_discontinuity')
             now_mono = time.monotonic()
+            confirmed = False
+            confirmation = 0
             with search_continuity_lock:
+                if allow_reconfirm:
+                    candidate = search_continuity_reconfirm_ids
+                    started = search_continuity_reconfirm_started
+                    age = now_mono - started if started is not None else float('inf')
+                    candidate_overlap = len(candidate & ids) / float(max(len(candidate), len(ids), 1))
+                    if (candidate and 0 <= age <= SEARCH_CONTINUITY_RECONFIRM_WINDOW
+                            and candidate_overlap >= SEARCH_CONTINUITY_COLD_CONFIRM_OVERLAP):
+                        search_continuity_reconfirm_count += 1
+                    else:
+                        candidate.clear()
+                        candidate.update(ids)
+                        search_continuity_reconfirm_count = 1
+                        search_continuity_reconfirm_started = now_mono
+                        age = 0.0
+                    confirmation = search_continuity_reconfirm_count
+                    if (confirmation >= SEARCH_CONTINUITY_RECONFIRMATIONS
+                            and age >= SEARCH_CONTINUITY_RECONFIRM_MIN_AGE):
+                        search_continuity_trusted_ids = set(ids)
+                        _clear_search_reconfirmation_locked()
+                        confirmed = True
+                else:
+                    _clear_search_reconfirmation_locked()
                 do_log = (now_mono - search_continuity_last_warn) >= SEARCH_CONTINUITY_WARN_INTERVAL
                 if do_log:
                     search_continuity_last_warn = now_mono
+            if confirmed:
+                logging.warning(
+                    f"✅ Search continuity RECONFIRMED: {confirmation} matching main-search pages; "
+                    f"new baseline={len(ids)} IDs. Возобновляем обычную проверку новых товаров."
+                )
+                return True
             if do_log:
                 logging.warning(
                     f"🛡 Search continuity HOLD: overlap={overlap_count}/{min(len(ids), len(trusted))} "
                     f"({overlap_ratio:.0%}) < {SEARCH_CONTINUITY_MIN_OVERLAP:.0%}; "
-                    "похоже на альтернативную выдачу eBay/proxy. seen_items и Telegram не трогаем."
+                    f"reconfirmation={confirmation}/{SEARCH_CONTINUITY_RECONFIRMATIONS}; "
+                    "ждём согласованную основную выдачу. seen_items и Telegram не трогаем."
                 )
             return False
 
     with search_continuity_lock:
         search_continuity_trusted_ids = set(ids)
+        _clear_search_reconfirmation_locked()
     return True
 
 
@@ -12524,6 +12584,7 @@ def _search_continuity_seed(current_ids):
         return
     with search_continuity_lock:
         search_continuity_trusted_ids = {str(x) for x in current_ids if x}
+        _clear_search_reconfirmation_locked()
 
 
 def perform_initial_snapshot():
@@ -12669,7 +12730,10 @@ def check_and_send_new_items():
         logging.info("Основная выдача eBay распознана, но подходящих карточек нет")
         return 'ok'
 
-    if not _search_continuity_accept(current.keys()):
+    if not _search_continuity_accept(
+        current.keys(),
+        allow_reconfirm=all(item.get('_continuity_rebase_safe', False) for item in current.values()),
+    ):
         return 'continuity_hold'
 
     # Атомарно claim только текущие item_id. После claim товар больше не будет считаться
@@ -12729,6 +12793,8 @@ def check_and_send_new_items():
                 f"Telegram не подтвердил отправку нового item {item['id']}. "
                 "ID оставлен в seen_items специально, чтобы не создать повторную отправку."
             )
+        else:
+            logging.info("📨 Telegram confirmed new item %s", item['id'])
 
         if idx < total_new:
             time.sleep(NEW_ITEM_TELEGRAM_GAP)
